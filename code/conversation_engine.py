@@ -37,15 +37,17 @@ class ConversationEngine:
             and os.path.exists(os.environ.get("QWEN_BASE_MODEL_PATH"))
         ):
             self.local_model_path = os.environ.get("QWEN_BASE_MODEL_PATH")
-        if lora_adapter_path:
-            self.lora_adapter_path = lora_adapter_path
-        elif not self.lora_adapter_path:
-            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            env_adapter_path = os.environ.get("QWEN_LORA_ADAPTER_PATH")
-            default_adapter_path = os.path.join(project_root, "distill", "output", "lora_sft_v7")
-            candidate_adapter_path = env_adapter_path or default_adapter_path
-            if os.path.exists(candidate_adapter_path):
-                self.lora_adapter_path = candidate_adapter_path
+        # LoRA adapter 已禁用，使用原始基础模型
+        # if lora_adapter_path:
+        #     self.lora_adapter_path = lora_adapter_path
+        # elif not self.lora_adapter_path:
+        #     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        #     env_adapter_path = os.environ.get("QWEN_LORA_ADAPTER_PATH")
+        #     default_adapter_path = os.path.join(project_root, "distill", "output", "lora_sft_v7")
+        #     candidate_adapter_path = env_adapter_path or default_adapter_path
+        #     if os.path.exists(candidate_adapter_path):
+        #         self.lora_adapter_path = candidate_adapter_path
+        self.lora_adapter_path = None
 
         print("Starting Qwen model initialization...")
 
@@ -151,7 +153,7 @@ class ConversationEngine:
         try:
             system_msg = """You are a friendly conversational partner helping someone practice English.
 Rules:
-1. Give detailed, natural responses (20-40 words)
+1. Give detailed, natural responses 
 2. Be conversational, warm and encouraging
 3. After answering, guide the conversation forward by:
    - Asking relevant follow-up questions

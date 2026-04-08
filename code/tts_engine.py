@@ -124,7 +124,7 @@ class TTSEngine:
                         pygame.mixer.init()
                     self.current_engine = "gtts"
                     print("✅ 使用gTTS引擎（Google语音合成）")
-            return True
+                    return True
                 except Exception as e:
                     print(f"gTTS初始化失败: {e}")
                     self.use_gtts = False
