@@ -7,7 +7,9 @@ Supports loading a local base model and optionally attaching a LoRA adapter.
 
 import os
 import re
+import threading
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import TextIteratorStreamer
 from peft import PeftModel
 import torch
 
@@ -224,3 +226,87 @@ You: "That sounds exciting! Where are you planning to go? Have you been there be
         except Exception as exc:
             print(f"Response generation failed: {exc}")
             return "Hello! How can I help you?"
+
+    def build_prompt(self, text_input, use_context=True):
+        """Build a chat prompt that matches the model's current formatting."""
+        system_msg = """You are a friendly conversational partner helping someone practice English.
+Rules:
+1. Give detailed, natural responses
+2. Be conversational, warm and encouraging
+3. After answering, guide the conversation forward by:
+   - Asking relevant follow-up questions
+   - Showing interest in what they said
+   - Naturally extending the topic
+4. Use complete sentences and natural English expressions
+5. NEVER simulate dialogues like "Human: ... Assistant: ..."
+6. Help maintain an engaging, flowing conversation
+7. Adapt to any topic naturally - daily life, travel, business, casual chat, etc.
+8. Respond as a real person would in that situation"""
+
+        if use_context:
+            return (
+                f"<|im_start|>system\n{system_msg}<|im_end|>\n"
+                f"<|im_start|>user\n{text_input}<|im_end|>\n"
+                "<|im_start|>assistant\n"
+            )
+
+        if not text_input.startswith("<|im_start|>"):
+            return f"<|im_start|>system\n{system_msg}<|im_end|>\n{text_input}"
+        if "<|im_start|>system" not in text_input:
+            return f"<|im_start|>system\n{system_msg}<|im_end|>\n{text_input}"
+        return text_input
+
+    def generate_response_stream(
+        self,
+        text_input,
+        max_length=512,
+        max_new_tokens=120,
+        use_context=True,
+        temperature=0.7,
+        top_p=0.9,
+    ):
+        """Yield incremental response text chunks for realtime clients."""
+        if self.qwen_model is None or self.qwen_tokenizer is None:
+            yield "Hello! How can I help you?"
+            return
+
+        prompt = self.build_prompt(text_input, use_context=use_context)
+        inputs = self.qwen_tokenizer(
+            prompt,
+            return_tensors="pt",
+            max_length=max_length,
+            truncation=True,
+        )
+
+        if torch.cuda.is_available():
+            inputs = {key: value.to("cuda") for key, value in inputs.items()}
+
+        streamer = TextIteratorStreamer(
+            self.qwen_tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True,
+        )
+
+        generation_kwargs = dict(
+            **inputs,
+            streamer=streamer,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            pad_token_id=self.qwen_tokenizer.eos_token_id,
+            eos_token_id=self.qwen_tokenizer.eos_token_id,
+            repetition_penalty=1.2,
+        )
+
+        worker = threading.Thread(
+            target=self.qwen_model.generate,
+            kwargs=generation_kwargs,
+            daemon=True,
+        )
+        worker.start()
+
+        for piece in streamer:
+            cleaned_piece = piece.replace("<|im_end|>", "")
+            if cleaned_piece:
+                yield cleaned_piece

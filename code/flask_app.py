@@ -49,6 +49,10 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 def init_system():
     """初始化语音对话系统"""
     global speech_system, audio_processor, conversation_engine, tts_engine
+
+    if audio_processor is not None and conversation_engine is not None and tts_engine is not None:
+        print("Flask backend components already initialized, skipping duplicate startup")
+        return True
     
     print("=" * 60)
     print("正在初始化Flask后端服务...")
@@ -57,7 +61,7 @@ def init_system():
     try:
         # 初始化各个组件
         audio_processor = AudioProcessor()
-        audio_processor.init_whisper()
+        audio_processor.init_sensevoice()
         
         # 设置本地模型路径
         local_model_path = os.path.join(
@@ -350,12 +354,12 @@ def speech_to_text():
                 'success': True,
                 'data': {
                     'text': recognized_text,
-                    'confidence': 0.95,  # Whisper不提供置信度，使用固定值
+                    'confidence': 0.95,  # SenseVoice 当前未返回统一置信度，先使用固定值
                     'language': detected_language,
                     'duration': round(duration, 2),
                     'metadata': {
                         'processing_time': round(processing_time, 2),
-                        'model_used': 'whisper-base'
+                        'model_used': audio_processor.asr_backend_name
                     }
                 },
                 'message': '语音识别成功'
