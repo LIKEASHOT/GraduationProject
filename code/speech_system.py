@@ -63,7 +63,7 @@ class CompleteSpeechSystem:
         # 初始化各个组件
         self.audio_processor = AudioProcessor()
         self.conversation_engine = ConversationEngine()
-        self.tts_engine = TTSEngine(prefer_edge_tts=not prefer_local_tts, prefer_local_tts=prefer_local_tts)  # 本地TTS优先，Edge TTS作为备选
+        self.tts_engine = TTSEngine(prefer_edge_tts=True, prefer_local_tts=True)  # Prefer local MOSS-TTS-Nano, then Edge/gTTS.
 
         self._init_components()
 

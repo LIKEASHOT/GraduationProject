@@ -79,7 +79,7 @@ def init_system():
         server_mode = sys.platform.startswith('linux')  # 在Linux服务器上启用服务器模式
         try:
             # 使用Edge TTS（支持中英文，稳定可靠）
-            tts_engine = TTSEngine(prefer_edge_tts=True, prefer_local_tts=False)
+            tts_engine = TTSEngine(prefer_edge_tts=True, prefer_local_tts=True)
         except TypeError:
             # 如果参数不支持，回退到默认设置
             print("⚠️ TTS引擎参数不支持，使用默认配置")
@@ -354,8 +354,8 @@ def speech_to_text():
                 'success': True,
                 'data': {
                     'text': recognized_text,
-                    'confidence': 0.95,  # SenseVoice 当前未返回统一置信度，先使用固定值
                     'language': detected_language,
+                    'confidence': 0.95,  # SenseVoice 当前未返回统一置信度，先使用固定值
                     'duration': round(duration, 2),
                     'metadata': {
                         'processing_time': round(processing_time, 2),
@@ -424,6 +424,37 @@ def text_to_speech():
         # 检测语言
         if language == 'auto':
             language = LanguageUtils.detect_text_language(text)
+
+        audio_file_path = tts_engine.generate_speech_file(text, save_dir=TEMP_DIR)
+        if not audio_file_path or not os.path.exists(audio_file_path):
+            return jsonify({
+                'success': False,
+                'error': {
+                    'code': 'TTS_FAILED',
+                    'message': 'TTS生成失败：没有可用的语音合成引擎'
+                }
+            }), 500
+
+        file_size = os.path.getsize(audio_file_path)
+        estimated_duration = len(text) * 0.1
+        processing_time = (time.time() - start_time) * 1000
+        file_id = os.path.basename(audio_file_path)
+        audio_url = f'/api/audio/{file_id}'
+
+        return jsonify({
+            'success': True,
+            'data': {
+                'audio_url': audio_url,
+                'duration': round(estimated_duration, 2),
+                'size': file_size,
+                'metadata': {
+                    'processing_time': round(processing_time, 2),
+                    'voice_used': language,
+                    'engine': tts_engine.get_current_engine_info()
+                }
+            },
+            'message': 'TTS生成成功'
+        })
         
         # 生成语音文件
         temp_file = tempfile.NamedTemporaryFile(
@@ -510,9 +541,16 @@ def get_audio(file_id):
                 }
             }), 404
         
+        ext = os.path.splitext(file_path)[1].lower()
+        mimetype = {
+            ".wav": "audio/wav",
+            ".mp3": "audio/mpeg",
+            ".ogg": "audio/ogg",
+        }.get(ext, "application/octet-stream")
+
         return send_file(
             file_path,
-            mimetype='audio/mpeg',
+            mimetype=mimetype,
             as_attachment=False
         )
         
@@ -571,6 +609,8 @@ def upload_file():
         file_size = os.path.getsize(temp_file.name)
         file_id = os.path.basename(temp_file.name)
         file_url = f'/api/audio/{file_id}'
+        recognized_text = ""
+        detected_language = "en"
 
         # 尝试验证音频文件
         try:
@@ -578,6 +618,9 @@ def upload_file():
             audio_data = audio_processor.load_audio_from_file(temp_file.name)
             if audio_data is not None:
                 duration = len(audio_data) / audio_processor.sample_rate
+                recognized_text = audio_processor.speech_to_text(audio_data)
+                detected_language = audio_processor._detect_text_language(recognized_text)
+                print(f"Upload ASR result: '{recognized_text}'")
                 print(f"✅ 音频文件验证通过，时长: {duration:.2f}秒")
             else:
                 duration = 0
@@ -591,6 +634,19 @@ def upload_file():
         return jsonify({
             'success': True,
             'file_id': file_id,
+            'file_url': file_url,
+            'text': recognized_text,
+            'data': {
+                'file_id': file_id,
+                'file_url': file_url,
+                'text': recognized_text,
+                'language': detected_language,
+                'duration': round(duration, 2),
+                'size': file_size,
+                'metadata': {
+                    'model_used': audio_processor.asr_backend_name
+                }
+            },
             'message': '文件上传成功'
         })
         

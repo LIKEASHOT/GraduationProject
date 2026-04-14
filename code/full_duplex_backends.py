@@ -10,20 +10,18 @@ import asyncio
 import base64
 import os
 import re
-import sys
 import tempfile
-import time
 import wave
 from dataclasses import dataclass
 from typing import AsyncIterator, Iterable, List, Optional
 
 import numpy as np
 from config import (
-    DEFAULT_COSYVOICE_MODEL,
     DEFAULT_QWEN_MODEL,
     DEFAULT_REALTIME_QWEN_MODEL,
     DEFAULT_SENSEVOICE_MODEL,
     REALTIME_AUDIO_CHUNK_SAMPLES,
+    REALTIME_TTS_AUDIO_CHUNK_SAMPLES,
     SAMPLE_RATE,
 )
 from conversation_engine import ConversationEngine
@@ -44,15 +42,21 @@ def split_sentences(text: str) -> List[str]:
     if not normalized:
         return []
 
-    sentence_breaks = "\u3002\uff01\uff1f!?."
+    normalized = _normalize_tts_text_boundaries(normalized)
+    protected = _extract_quoted_spans(normalized)
+    if protected:
+        segments = _split_mixed_text_with_quotes(normalized)
+        return _merge_short_tts_prefixes(segments)
+
+    sentence_breaks = "\u3002\uff01\uff1f!?"
     soft_breaks = "\uff0c,\uff1b;:\uff1a"
-    pieces = re.split(rf"(?<=[{sentence_breaks}{soft_breaks}])", normalized)
+    pieces = re.split(rf"(?<=[{sentence_breaks}{soft_breaks}])\s+|(?<=[{sentence_breaks}{soft_breaks}])", normalized)
     segments: List[str] = []
     current = ""
 
     for piece in pieces:
-        piece = piece.strip()
-        if not piece:
+        piece = _clean_tts_segment(piece)
+        if not piece or _is_punctuation_only(piece):
             continue
         candidate = f"{current}{piece}".strip()
         if len(candidate) < 10 and candidate[-1] not in sentence_breaks + soft_breaks:
@@ -69,11 +73,121 @@ def split_sentences(text: str) -> List[str]:
 
     short_segments: List[str] = []
     for segment in segments or [normalized]:
-        short_segments.extend(_split_long_tts_segment(segment, max_chars=18))
-    return short_segments
+        short_segments.extend(_split_long_tts_segment(segment, max_chars=24, max_words=12))
+    return _merge_short_tts_prefixes(short_segments)
 
 
-def _split_long_tts_segment(text: str, max_chars: int) -> List[str]:
+def _normalize_tts_text_boundaries(text: str) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r'"\s*([^"]+?)\s*"', r'"\1"', text)
+    return text
+
+
+def _extract_quoted_spans(text: str) -> List[tuple[int, int, str]]:
+    spans: List[tuple[int, int, str]] = []
+    for match in re.finditer(r'"[^"]+"', text):
+        quoted = match.group(0)
+        inner = quoted.strip('"')
+        if _should_protect_quoted_span(inner):
+            spans.append((match.start(), match.end(), quoted))
+    return spans
+
+
+def _should_protect_quoted_span(text: str) -> bool:
+    cjk_count = len(re.findall(r"[\u4e00-\u9fff]", text))
+    latin_count = len(re.findall(r"[A-Za-z]", text))
+    if latin_count == 0:
+        return False
+    if cjk_count == 0:
+        return True
+    return latin_count >= cjk_count
+
+
+def _split_mixed_text_with_quotes(text: str) -> List[str]:
+    spans = _extract_quoted_spans(text)
+    if not spans:
+        return split_sentences(text.replace('"', ""))
+    raw_segments: List[str] = []
+    cursor = 0
+    for start, end, quoted in spans:
+        raw_segments.extend(_split_non_quoted_text(text[cursor:start]))
+        raw_segments.append(_clean_tts_segment(quoted))
+        cursor = end
+    raw_segments.extend(_split_non_quoted_text(text[cursor:]))
+
+    segments: List[str] = []
+    for segment in raw_segments:
+        segment = _clean_tts_segment(segment)
+        if not segment or _is_punctuation_only(segment):
+            continue
+        if segment.startswith('"') and segment.endswith('"'):
+            segments.append(segment)
+            continue
+        segments.extend(_split_long_tts_segment(segment, max_chars=24, max_words=12))
+    return segments
+
+
+def _split_non_quoted_text(text: str) -> List[str]:
+    text = _clean_tts_segment(text)
+    if not text:
+        return []
+    sentence_breaks = "\u3002\uff01\uff1f!?"
+    soft_breaks = "\uff0c,\uff1b;:\uff1a"
+    pieces = re.split(rf"(?<=[{sentence_breaks}{soft_breaks}])\s*|(?<=[{soft_breaks}])\s*", text)
+    return [_clean_tts_segment(piece) for piece in pieces if _clean_tts_segment(piece)]
+
+
+def _merge_short_tts_prefixes(segments: List[str]) -> List[str]:
+    merged: List[str] = []
+    pending = ""
+    prefix_endings = tuple("\uff1a:，,")
+
+    for segment in segments:
+        segment = _clean_tts_segment(segment)
+        if not segment or _is_punctuation_only(segment):
+            continue
+
+        if pending:
+            segment = f"{pending} {segment}".strip()
+            pending = ""
+
+        plain_len = len(re.sub(r"\s+", "", segment))
+        word_count = len(re.findall(r"[A-Za-z0-9]+", segment))
+        if segment.endswith(prefix_endings) and (plain_len <= 12 or 0 < word_count <= 3):
+            pending = segment
+            continue
+
+        merged.append(segment)
+
+    if pending:
+        if merged:
+            merged[-1] = f"{merged[-1]} {pending}".strip()
+        else:
+            merged.append(pending.rstrip("\uff1a:，,"))
+    return merged
+
+
+def _clean_tts_segment(text: str) -> str:
+    cleaned = str(text or "").strip().strip("\n\r\t ")
+    return cleaned.strip('"“”')
+
+
+def _is_punctuation_only(text: str) -> bool:
+    return not re.search(r"[\w\u4e00-\u9fff]", text or "")
+
+
+def _contains_cjk(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", text))
+
+
+def _split_long_tts_segment(text: str, max_chars: int, max_words: int) -> List[str]:
+    text = _clean_tts_segment(text)
+    if not text or _is_punctuation_only(text):
+        return []
+    if text.startswith('"') and text.endswith('"'):
+        return [text]
+    if not _contains_cjk(text):
+        return _split_english_tts_segment(text, max_words=max_words, max_chars=max_chars * 4)
     if len(text) <= max_chars:
         return [text]
     chunks: List[str] = []
@@ -88,6 +202,277 @@ def _split_long_tts_segment(text: str, max_chars: int) -> List[str]:
     return chunks
 
 
+def _split_english_tts_segment(text: str, max_words: int, max_chars: int) -> List[str]:
+    tokens = re.findall(r'"[^"]+"|\S+', text)
+    if not tokens:
+        return []
+
+    chunks: List[str] = []
+    current_tokens: List[str] = []
+    current_words = 0
+
+    for token in tokens:
+        token_words = len(re.findall(r"[A-Za-z0-9]+", token)) or 1
+        candidate = " ".join(current_tokens + [token]).strip()
+        should_flush = (
+            current_tokens
+            and (current_words + token_words > max_words or len(candidate) > max_chars)
+        )
+        if should_flush:
+            chunks.append(" ".join(current_tokens).strip())
+            current_tokens = [token]
+            current_words = token_words
+        else:
+            current_tokens.append(token)
+            current_words += token_words
+
+    if current_tokens:
+        chunks.append(" ".join(current_tokens).strip())
+
+    return [chunk for chunk in chunks if chunk and not _is_punctuation_only(chunk)]
+
+
+def split_sentences(text: str) -> List[str]:
+    """Split TTS text by punctuation and budget without treating quotes as atomic."""
+    normalized = TextProcessor.clean_response(text)
+    if not normalized:
+        return []
+
+    normalized = _tts_normalize_text(normalized)
+    primary_segments = _tts_split_by_punctuation(normalized)
+    budgeted_segments: List[str] = []
+    for segment in primary_segments or [normalized]:
+        budgeted_segments.extend(_tts_split_by_budget(segment))
+    return _tts_enforce_final_budget(_tts_merge_short_prefixes(budgeted_segments))
+
+
+def _tts_normalize_text(text: str) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.replace("\u201c", '"').replace("\u201d", '"')
+    text = text.replace("\u2018", "'").replace("\u2019", "'")
+    return text.strip('"')
+
+
+def _tts_clean_segment(text: str) -> str:
+    return str(text or "").strip().strip("\n\r\t ").strip('"')
+
+
+def _tts_split_by_punctuation(text: str) -> List[str]:
+    cjk_breaks = set("\u3002\uff01\uff1f\uff0c\uff1b\uff1a")
+    sentence_breaks = set(".!?")
+    soft_breaks = set(",;:")
+    closers = set('"\'\u201d\u2019\uff09)]}\u300b\u300d\u300f')
+    segments: List[str] = []
+    current = ""
+
+    for index, char in enumerate(text):
+        current += char
+        if char not in cjk_breaks and char not in sentence_breaks and char not in soft_breaks:
+            continue
+        if char == "." and _tts_is_decimal_or_abbreviation(text, index):
+            continue
+
+        if char in cjk_breaks:
+            segment = _tts_clean_segment(current)
+            if segment and not _is_punctuation_only(segment):
+                segments.append(segment)
+            current = ""
+            continue
+
+        next_char = text[index + 1] if index + 1 < len(text) else ""
+        if char in soft_breaks and len(current.strip()) < 8:
+            continue
+        if next_char and next_char not in " \t\r\n" and next_char not in closers:
+            continue
+
+        segment = _tts_clean_segment(current)
+        if segment and not _is_punctuation_only(segment):
+            segments.append(segment)
+        current = ""
+
+    tail = _tts_clean_segment(current)
+    if tail and not _is_punctuation_only(tail):
+        segments.append(tail)
+    return segments
+
+
+def _tts_is_decimal_or_abbreviation(text: str, index: int) -> bool:
+    previous = text[index - 1] if index > 0 else ""
+    next_char = text[index + 1] if index + 1 < len(text) else ""
+    if previous.isdigit() and next_char.isdigit():
+        return True
+    if previous.isupper() and (not next_char or next_char.isspace()):
+        return True
+    return False
+
+
+def _tts_split_by_budget(text: str) -> List[str]:
+    text = _tts_clean_segment(text)
+    if not text or _is_punctuation_only(text):
+        return []
+
+    max_cjk_chars = int(os.environ.get("REALTIME_TTS_MAX_CJK_CHARS", "34"))
+    max_en_words = int(os.environ.get("REALTIME_TTS_MAX_EN_WORDS", "14"))
+    max_mixed_chars = int(os.environ.get("REALTIME_TTS_MAX_MIXED_CHARS", "56"))
+
+    latin_words = _tts_latin_word_count(text)
+    has_cjk = _contains_cjk(text)
+    if not has_cjk:
+        return _tts_split_latin_by_words(text, max_words=max_en_words, max_chars=max_mixed_chars * 2)
+    if len(text) <= max_cjk_chars and latin_words <= max_en_words:
+        return [text]
+    if latin_words >= 4:
+        return _tts_split_mixed_by_tokens(text, max_chars=max_mixed_chars, max_words=max_en_words)
+    return _tts_split_cjk_by_chars(text, max_chars=max_cjk_chars)
+
+
+def _tts_split_cjk_by_chars(text: str, max_chars: int) -> List[str]:
+    chunks: List[str] = []
+    current = ""
+    for char in text:
+        current += char
+        if len(current) < max_chars:
+            continue
+        chunk = _tts_clean_segment(current)
+        if chunk and not _is_punctuation_only(chunk):
+            chunks.append(chunk)
+        current = ""
+    tail = _tts_clean_segment(current)
+    if tail and not _is_punctuation_only(tail):
+        chunks.append(tail)
+    return chunks
+
+
+def _tts_merge_tiny_chunks(chunks: List[str]) -> List[str]:
+    if len(chunks) <= 1:
+        return chunks
+
+    merged: List[str] = []
+    index = 0
+    while index < len(chunks):
+        chunk = chunks[index]
+        word_count = _tts_latin_word_count(chunk)
+        if word_count and word_count <= 3:
+            if index + 1 < len(chunks):
+                merged.append(_tts_join_segments(chunk, chunks[index + 1]))
+                index += 2
+                continue
+            if merged:
+                merged[-1] = _tts_join_segments(merged[-1], chunk)
+                index += 1
+                continue
+        merged.append(chunk)
+        index += 1
+    return merged
+
+
+def _tts_split_mixed_by_tokens(text: str, max_chars: int, max_words: int) -> List[str]:
+    tokens = re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?|[\u4e00-\u9fff]+|[^\s]", text)
+    return _tts_pack_tokens(tokens, max_chars=max_chars, max_words=max_words)
+
+
+def _tts_split_latin_by_words(text: str, max_words: int, max_chars: int) -> List[str]:
+    tokens = re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?|[^\s]", text)
+    return _tts_pack_tokens(tokens, max_chars=max_chars, max_words=max_words)
+
+
+def _tts_pack_tokens(tokens: List[str], max_chars: int, max_words: int) -> List[str]:
+    chunks: List[str] = []
+    current = ""
+    current_words = 0
+
+    for token in tokens:
+        token_words = 1 if re.match(r"[A-Za-z0-9]", token) else 0
+        separator = " " if current and _tts_needs_space(current[-1], token[0]) else ""
+        candidate = f"{current}{separator}{token}"
+        should_flush = current and (len(candidate) > max_chars or current_words + token_words > max_words)
+        if should_flush:
+            chunk = _tts_clean_segment(current)
+            if chunk and not _is_punctuation_only(chunk):
+                chunks.append(chunk)
+            current = token
+            current_words = token_words
+        else:
+            current = candidate
+            current_words += token_words
+
+    tail = _tts_clean_segment(current)
+    if tail and not _is_punctuation_only(tail):
+        chunks.append(tail)
+    return _tts_merge_tiny_chunks(chunks)
+
+
+def _tts_needs_space(left: str, right: str) -> bool:
+    if right in ".,!?;:%)]}":
+        return False
+    if left in "([{$\"'":
+        return False
+    if right in "\"'":
+        return False
+    return bool(re.match(r"[A-Za-z0-9]", left) or re.match(r"[A-Za-z0-9]", right))
+
+
+def _tts_latin_word_count(text: str) -> int:
+    return len(re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", text))
+
+
+def _tts_is_list_marker(text: str) -> bool:
+    return bool(re.fullmatch(r"\d+[\.)\u3001\uff0e]?", _tts_clean_segment(text)))
+
+
+def _tts_merge_short_prefixes(segments: List[str]) -> List[str]:
+    merged: List[str] = []
+    pending = ""
+    prefix_endings = ("\uff1a", ":", "\uff0c", ",", "\uff1b", ";")
+
+    for segment in segments:
+        segment = _tts_clean_segment(segment)
+        if not segment or _is_punctuation_only(segment):
+            continue
+
+        if _tts_is_list_marker(segment):
+            pending = _tts_join_segments(pending, segment) if pending else segment
+            continue
+
+        if pending:
+            segment = _tts_join_segments(pending, segment)
+            pending = ""
+
+        plain_len = len(re.sub(r"\s+", "", segment))
+        word_count = _tts_latin_word_count(segment)
+        if segment.endswith(prefix_endings) and (plain_len <= 16 or 0 < word_count <= 3):
+            pending = segment
+            continue
+
+        merged.append(segment)
+
+    if pending:
+        if merged:
+            merged[-1] = _tts_join_segments(merged[-1], pending)
+        else:
+            merged.append(pending.rstrip("\uff1a:\uff0c,\uff1b;"))
+    return merged
+
+
+def _tts_join_segments(left: str, right: str) -> str:
+    left = _tts_clean_segment(left)
+    right = _tts_clean_segment(right)
+    if not left:
+        return right
+    if not right:
+        return left
+    if left[-1] in "\u3002\uff01\uff1f\uff0c\uff1b\uff1a":
+        return f"{left}{right}"
+    return f"{left} {right}".strip()
+
+
+def _tts_enforce_final_budget(segments: List[str]) -> List[str]:
+    final_segments: List[str] = []
+    for segment in segments:
+        final_segments.extend(_tts_split_by_budget(segment))
+    return [segment for segment in final_segments if segment and not _is_punctuation_only(segment)]
+
+
 @dataclass
 class SynthesizedSegment:
     text: str
@@ -95,7 +480,7 @@ class SynthesizedSegment:
     sample_rate: int
     audio_format: str = "pcm"
 
-    def iter_base64_chunks(self, chunk_samples: int = REALTIME_AUDIO_CHUNK_SAMPLES) -> Iterable[str]:
+    def iter_base64_chunks(self, chunk_samples: int = REALTIME_TTS_AUDIO_CHUNK_SAMPLES) -> Iterable[str]:
         frame_size = max(1, chunk_samples) * 2
         for index in range(0, len(self.pcm_bytes), frame_size):
             yield base64.b64encode(self.pcm_bytes[index:index + frame_size]).decode("utf-8")
@@ -210,159 +595,54 @@ class QwenRealtimeBackend:
                 break
             yield chunk
 
+    async def generate_full(self, history: List[dict], user_text: str) -> str:
+        """Generate a complete response before TTS starts."""
+        self.load()
+        context_prompt = self.build_context_prompt(history, user_text)
+        return await asyncio.to_thread(
+            self.engine.generate_response,
+            context_prompt,
+            512,
+            False,
+            True,
+            False,
+        )
 
-class CosyVoiceTTSBackend:
-    """TTS adapter that prefers CosyVoice and falls back to the mature TTSEngine."""
+
+class RealtimeTTSBackend:
+    """Realtime TTS adapter using the previous stable Edge/gTTS stack only."""
 
     def __init__(self, sample_rate: int = SAMPLE_RATE) -> None:
         self.sample_rate = sample_rate
-        self.model_name = os.environ.get("COSYVOICE_MODEL_NAME", DEFAULT_COSYVOICE_MODEL)
-        self.local_model_path = os.environ.get("COSYVOICE_MODEL_PATH") or _default_model_path("CosyVoice-300M-SFT")
-        self._cosyvoice = None
-        self._fallback_tts: Optional[TTSEngine] = None
-        self.backend_name = "cosyvoice"
-        self.speaker = os.environ.get("COSYVOICE_SPEAKER")
-        self.use_streaming = os.environ.get("COSYVOICE_STREAM", "1") != "0"
+        self._tts: Optional[TTSEngine] = None
+        self.backend_name = "edge/gtts"
 
     def load(self) -> None:
-        if self._cosyvoice is not None or self._fallback_tts is not None:
+        if self._tts is not None:
             return
 
-        try:
-            project_root = _project_root()
-            local_cosyvoice_repo = os.environ.get("COSYVOICE_REPO_PATH") or os.path.join(project_root, "CosyVoice")
-            if os.path.exists(local_cosyvoice_repo) and local_cosyvoice_repo not in sys.path:
-                sys.path.insert(0, local_cosyvoice_repo)
-            local_matcha = os.path.join(local_cosyvoice_repo, "third_party", "Matcha-TTS")
-            if os.path.exists(local_matcha) and local_matcha not in sys.path:
-                sys.path.insert(0, local_matcha)
-            try:
-                from cosyvoice.cli.cosyvoice import CosyVoice as CosyVoiceModel
-            except ImportError:
-                from cosyvoice.cli.cosyvoice import AutoModel as CosyVoiceModel
-
-            model_path = self.local_model_path if os.path.exists(self.local_model_path) else self.model_name
-            use_fp16 = _should_use_fp16()
-            self._cosyvoice = CosyVoiceModel(model_path, fp16=use_fp16)
-            self.speaker = self._resolve_speaker()
-            self.backend_name = "cosyvoice"
-            print(f"[full_duplex] CosyVoice ready: {model_path}")
-            print(f"[full_duplex] CosyVoice speaker: {self.speaker}")
-            print(f"[full_duplex] CosyVoice fp16: {use_fp16}")
-            return
-        except Exception as exc:
-            print(f"[full_duplex] CosyVoice unavailable, fallback to TTSEngine: {exc}")
-
-        self._fallback_tts = TTSEngine(prefer_edge_tts=True, prefer_local_tts=False)
-        self._fallback_tts.init_tts()
-        self.backend_name = "legacy-tts"
+        self._tts = TTSEngine(prefer_edge_tts=True, prefer_local_tts=True)
+        self._tts.init_tts()
+        print(f"[full_duplex] Realtime TTS engine: {self._tts.get_current_engine_info()}")
 
     async def synthesize(self, text: str) -> SynthesizedSegment:
         self.load()
-        if self._cosyvoice is not None:
-            try:
-                return await asyncio.to_thread(self._synthesize_with_cosyvoice, text)
-            except Exception as exc:
-                print(f"[full_duplex] CosyVoice synthesis failed, use fallback: {exc}")
-
-        return await asyncio.to_thread(self._synthesize_with_legacy_tts, text)
+        return await asyncio.to_thread(self._synthesize_with_stable_tts, text)
 
     async def synthesize_stream(self, text: str) -> AsyncIterator[SynthesizedSegment]:
-        """Yield TTS audio segments as soon as CosyVoice produces them."""
+        """Keep the realtime API shape while using the stable file-based TTS path."""
         self.load()
-        if self._cosyvoice is None:
-            yield await asyncio.to_thread(self._synthesize_with_legacy_tts, text)
-            return
+        yield await asyncio.to_thread(self._synthesize_with_stable_tts, text)
 
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[Optional[SynthesizedSegment]] = asyncio.Queue()
+    def _synthesize_with_stable_tts(self, text: str) -> SynthesizedSegment:
+        if self._tts is None:
+            self.load()
+        if self._tts is None:
+            raise RuntimeError("Stable TTSEngine is not initialized")
 
-        def worker() -> None:
-            start_time = time.time()
-            first_segment = True
-            try:
-                for segment in self._synthesize_with_cosyvoice_stream(text):
-                    if first_segment:
-                        print(f"[full_duplex][TTS] first audio ready in {time.time() - start_time:.2f}s")
-                        first_segment = False
-                    asyncio.run_coroutine_threadsafe(queue.put(segment), loop)
-            except Exception as exc:
-                print(f"[full_duplex] CosyVoice streaming synthesis failed: {exc}")
-                try:
-                    fallback = self._synthesize_with_legacy_tts(text)
-                    asyncio.run_coroutine_threadsafe(queue.put(fallback), loop)
-                except Exception as fallback_exc:
-                    print(f"[full_duplex] TTS fallback failed: {fallback_exc}")
-            finally:
-                asyncio.run_coroutine_threadsafe(queue.put(None), loop)
-
-        asyncio.create_task(asyncio.to_thread(worker))
-
-        while True:
-            segment = await queue.get()
-            if segment is None:
-                break
-            yield segment
-
-    def _synthesize_with_cosyvoice(self, text: str) -> SynthesizedSegment:
-        generator = self._cosyvoice.inference_sft(text, self.speaker, stream=self.use_streaming)
-        for item in generator:
-            segment = self._segment_from_cosyvoice_item(text, item)
-            if segment:
-                return segment
-        raise RuntimeError("CosyVoice returned no audio")
-
-    def _synthesize_with_cosyvoice_stream(self, text: str) -> Iterable[SynthesizedSegment]:
-        generator = self._cosyvoice.inference_sft(text, self.speaker, stream=self.use_streaming)
-        emitted = False
-        for item in generator:
-            segment = self._segment_from_cosyvoice_item(text, item)
-            if segment:
-                emitted = True
-                yield segment
-        if not emitted:
-            raise RuntimeError("CosyVoice returned no audio")
-
-    def _segment_from_cosyvoice_item(self, text: str, item: dict) -> Optional[SynthesizedSegment]:
-        waveform = item.get("tts_speech")
-        if waveform is None:
-            return None
-        audio = waveform.detach().cpu().numpy() if hasattr(waveform, "detach") else np.asarray(waveform)
-        audio = np.squeeze(audio).astype(np.float32)
-        source_sample_rate = int(getattr(self._cosyvoice, "sample_rate", self.sample_rate))
-        audio = _resample_audio(audio, source_sample_rate, self.sample_rate)
-        return SynthesizedSegment(text=text, pcm_bytes=_float32_to_pcm16(audio), sample_rate=self.sample_rate)
-
-    def _resolve_speaker(self) -> str:
-        requested = os.environ.get("COSYVOICE_SPEAKER")
-        available = []
-        if hasattr(self._cosyvoice, "list_available_spks"):
-            try:
-                available = list(self._cosyvoice.list_available_spks())
-            except Exception:
-                available = []
-
-        if requested:
-            if not available or requested in available:
-                return requested
-            print(f"[full_duplex] Requested CosyVoice speaker `{requested}` not found. Available speakers: {available}")
-
-        if available:
-            return available[0]
-
-        raise RuntimeError(
-            "CosyVoice model has no SFT speakers. Use a model with `spk2info.pt` "
-            "or configure zero-shot/cross-lingual synthesis."
-        )
-
-    def _synthesize_with_legacy_tts(self, text: str) -> SynthesizedSegment:
-        if self._fallback_tts is None:
-            self._fallback_tts = TTSEngine(prefer_edge_tts=True, prefer_local_tts=False)
-            self._fallback_tts.init_tts()
-
-        audio_file = self._fallback_tts.generate_speech_file(text, save_dir=tempfile.gettempdir())
+        audio_file = self._tts.generate_speech_file(text, save_dir=tempfile.gettempdir())
         if not audio_file or not os.path.exists(audio_file):
-            raise RuntimeError("Fallback TTSEngine did not create an audio file")
+            raise RuntimeError("TTSEngine did not create an audio file")
 
         try:
             pcm_bytes, sample_rate = _load_audio_file_as_pcm(audio_file, self.sample_rate)
@@ -380,7 +660,7 @@ class RealtimeBackendBundle:
     def __init__(self) -> None:
         self.asr = SenseVoiceASRBackend()
         self.llm = QwenRealtimeBackend()
-        self.tts = CosyVoiceTTSBackend()
+        self.tts = RealtimeTTSBackend()
 
     def warmup(self) -> None:
         self.asr.load()
@@ -392,28 +672,6 @@ def _float32_to_pcm16(audio: np.ndarray) -> bytes:
     clipped = np.clip(audio, -1.0, 1.0)
     int16_audio = (clipped * 32767.0).astype(np.int16)
     return int16_audio.tobytes()
-
-
-def _should_use_fp16() -> bool:
-    if os.environ.get("COSYVOICE_FP16", "1") == "0":
-        return False
-    try:
-        import torch
-
-        return bool(torch.cuda.is_available())
-    except Exception:
-        return False
-
-
-def _resample_audio(audio: np.ndarray, source_sample_rate: int, target_sample_rate: int) -> np.ndarray:
-    if source_sample_rate == target_sample_rate:
-        return audio.astype(np.float32)
-    from scipy import signal
-
-    target_length = int(len(audio) * target_sample_rate / source_sample_rate)
-    if target_length <= 0:
-        return np.array([], dtype=np.float32)
-    return signal.resample(audio, target_length).astype(np.float32)
 
 
 def _load_audio_file_as_pcm(file_path: str, target_sample_rate: int) -> tuple[bytes, int]:
@@ -437,4 +695,31 @@ def _load_audio_file_as_pcm(file_path: str, target_sample_rate: int) -> tuple[by
         audio_data = signal.resample(audio_data, target_length).astype(np.float32)
         sample_rate = target_sample_rate
 
+    audio_data = _trim_tts_silence(audio_data, sample_rate)
+
     return _float32_to_pcm16(np.asarray(audio_data, dtype=np.float32)), sample_rate
+
+
+def _trim_tts_silence(audio_data: np.ndarray, sample_rate: int) -> np.ndarray:
+    """Trim leading/trailing silence that makes segmented TTS sound choppy."""
+    if os.environ.get("DISABLE_TTS_SILENCE_TRIM", "0") == "1":
+        return audio_data
+
+    audio = np.asarray(audio_data, dtype=np.float32).flatten()
+    if audio.size == 0:
+        return audio
+
+    threshold = float(os.environ.get("TTS_SILENCE_TRIM_THRESHOLD", "0.008"))
+    keep_ms = int(os.environ.get("TTS_SILENCE_KEEP_MS", "40"))
+    mask = np.abs(audio) > threshold
+    if not np.any(mask):
+        return audio
+
+    indices = np.flatnonzero(mask)
+    keep_samples = max(0, sample_rate * keep_ms // 1000)
+    start = max(0, int(indices[0]) - keep_samples)
+    end = min(audio.size, int(indices[-1]) + keep_samples)
+    trimmed = audio[start:end]
+    if trimmed.size < sample_rate * 0.12:
+        return audio
+    return trimmed

@@ -25,7 +25,6 @@ cloudpathlib==0.23.0
 confection==0.1.5
 contourpy==1.2.1
 coqpit==0.0.17
-cosyvoice
 cycler==0.12.1
 cymem==2.0.13
 Cython==0.29.30
@@ -78,7 +77,7 @@ kiwisolver==1.4.7
 kornia==0.8.2
 kornia_rs==0.1.10
 lazy_loader==0.4
-librosa==0.10.0
+librosa==0.9.1
 llvmlite==0.40.1
 Markdown==3.9
 MarkupSafe==2.1.5
@@ -91,7 +90,7 @@ multidict==6.7.0
 murmurhash==1.0.15
 networkx==2.8.8
 nltk==3.9.2
-num2words==0.5.14
+num2words==0.5.12
 numba==0.57.0
 numpy==1.22.0
 nvidia-cublas-cu12==12.8.4.1
@@ -116,7 +115,7 @@ platformdirs==4.4.0
 pooch==1.8.2
 preshed==3.0.12
 propcache==0.4.1
-protobuf==6.33.4
+protobuf==4.25.8
 psutil==7.2.1
 PyAudio==0.2.14
 pycparser==2.23
@@ -161,7 +160,7 @@ thinc==8.3.9
 threadpoolctl==3.6.0
 tifffile==2024.8.30
 tiktoken==0.12.0
-tokenizers==0.22.2
+tokenizers==0.21.4
 torch==2.8.0
 torchaudio==2.8.0+cu128
 torchdiffeq==0.2.5
@@ -170,7 +169,7 @@ torchvision==0.23.0
 tqdm==4.64.1
 trainer==0.0.36
 trampoline==0.1.2
-transformers==4.57.5
+transformers==4.51.3
 triton==3.4.0
 TTS==0.17.4
 typeguard==4.4.4

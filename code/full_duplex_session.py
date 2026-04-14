@@ -12,6 +12,7 @@ import asyncio
 import base64
 import io
 import json
+import os
 import uuid
 from typing import Dict, List, Optional, Tuple
 
@@ -134,10 +135,18 @@ class FullDuplexSession:
             return
 
         print(f"[full_duplex][ASR] user_text: {transcript}")
-        await self._send("user_text", {"text": transcript, "is_final": True})
         self.history.append({"role": "user", "content": transcript})
         self.history = self.history[-REALTIME_MAX_HISTORY_TURNS * 2 :]
         await self._start_assistant_turn(transcript)
+        await self._send(
+            "user_text",
+            {
+                "turn_id": self._active_turn_id,
+                "message_id": f"{self._active_message_id}_user" if self._active_message_id else None,
+                "text": transcript,
+                "is_final": True,
+            },
+        )
 
     async def _start_assistant_turn(self, user_text: str) -> None:
         async with self._turn_lock:
@@ -156,49 +165,39 @@ class FullDuplexSession:
 
     async def _generate_assistant_reply(self, user_text: str) -> None:
         try:
-            async for chunk in self.backends.llm.generate(self.history, user_text):
-                if self._state == "INTERRUPTING":
-                    break
+            response_text = await self.backends.llm.generate_full(self.history, user_text)
+            response_text = response_text.strip()
+            if self._state == "INTERRUPTING" or not response_text:
+                return
 
-                cleaned = chunk.strip()
-                if not cleaned:
-                    continue
-
-                print(f"[full_duplex][LLM] chunk: {chunk}", end="", flush=True)
-                await self._send(
-                    "ai_text",
-                    {
-                        "turn_id": self._active_turn_id,
-                        "message_id": self._active_message_id,
-                        "text": chunk,
-                        "is_final": False,
-                    },
-                )
-
-                self._assistant_sentence_buffer += chunk
-                ready_segments, remainder = _extract_ready_segments(self._assistant_sentence_buffer)
-                self._assistant_sentence_buffer = remainder
-                for segment in ready_segments:
-                    print(f"\n[full_duplex][TTS] queued segment: {segment}")
-                    await self._tts_queue.put(segment)
-
-            final_buffer = self._assistant_sentence_buffer.strip()
-            self._assistant_sentence_buffer = ""
-            if final_buffer:
-                for segment in split_sentences(final_buffer):
-                    print(f"\n[full_duplex][TTS] queued final segment: {segment}")
-                    await self._tts_queue.put(segment)
-
-            await self._tts_queue.put(None)
+            print(f"[full_duplex][LLM] full response: {response_text}")
             await self._send(
                 "ai_text",
                 {
                     "turn_id": self._active_turn_id,
                     "message_id": self._active_message_id,
-                    "text": "",
-                    "is_final": True,
+                    "text": response_text,
+                    "is_final": False,
                 },
             )
+
+            for segment in split_sentences(response_text):
+                if self._state == "INTERRUPTING":
+                    break
+                print(f"[full_duplex][TTS] queued segment: {segment}")
+                await self._tts_queue.put(segment)
+
+            await self._tts_queue.put(None)
+            if self._state != "INTERRUPTING":
+                await self._send(
+                    "ai_text",
+                    {
+                        "turn_id": self._active_turn_id,
+                        "message_id": self._active_message_id,
+                        "text": response_text,
+                        "is_final": True,
+                    },
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -223,6 +222,10 @@ class FullDuplexSession:
     async def _stream_tts_segment(self, synthesized: SynthesizedSegment) -> None:
         segment_text = synthesized.text.strip()
         if not segment_text:
+            return
+
+        if os.environ.get("REALTIME_TTS_SEND_MODE", "segment").lower() != "chunk":
+            await self._send_tts_segment_as_single_chunk(synthesized, segment_text)
             return
 
         first_chunk = True
@@ -265,6 +268,33 @@ class FullDuplexSession:
                 "text_span": segment_text,
             },
         )
+
+    async def _send_tts_segment_as_single_chunk(self, synthesized: SynthesizedSegment, segment_text: str) -> None:
+        duration = 0.0
+        if synthesized.sample_rate > 0:
+            duration = len(synthesized.pcm_bytes) / 2 / synthesized.sample_rate
+
+        print(
+            f"[full_duplex][TTS] sending segment audio: text='{segment_text}', "
+            f"sample_rate={synthesized.sample_rate}, bytes={len(synthesized.pcm_bytes)}, "
+            f"duration={duration:.2f}s"
+        )
+        await self._send(
+            "tts_audio_chunk",
+            {
+                "turn_id": self._active_turn_id,
+                "message_id": self._active_message_id,
+                "audio": base64.b64encode(synthesized.pcm_bytes).decode("utf-8"),
+                "format": synthesized.audio_format,
+                "sample_rate": synthesized.sample_rate,
+                "chunk_id": f"{self._active_turn_id}_segment_{len(self._assistant_dispatched_segments) + 1}",
+                "is_last_chunk": True,
+                "text_span": segment_text,
+                "send_mode": "segment",
+                "duration": round(duration, 3),
+            },
+        )
+        self._assistant_dispatched_segments.append(segment_text)
 
     async def _interrupt_current_turn(self, reason: str, notify_client: bool) -> None:
         if self._state != "AI_SPEAKING":
