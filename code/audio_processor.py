@@ -55,7 +55,13 @@ class AudioProcessor:
                 break
 
         try:
-            self.asr_model = AutoModel(model=model_target, vad_model=None, punc_model=None, spk_model=None)
+            self.asr_model = AutoModel(
+                model=model_target,
+                vad_model=None,
+                punc_model=None,
+                spk_model=None,
+                disable_update=True,
+            )
             print(f"SenseVoice ASR ready: {model_target}")
             return self.asr_model
         except Exception as exc:

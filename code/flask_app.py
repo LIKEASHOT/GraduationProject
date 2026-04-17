@@ -11,6 +11,7 @@ import base64
 import tempfile
 import time
 import traceback
+import threading
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import numpy as np
@@ -28,6 +29,7 @@ if sys.platform == 'win32':
 from speech_system import CompleteSpeechSystem
 from audio_processor import AudioProcessor
 from conversation_engine import ConversationEngine
+from dialogue_policy import DialoguePolicy
 from tts_engine import TTSEngine
 from language_utils import LanguageUtils
 
@@ -44,6 +46,10 @@ tts_engine = None
 # 创建临时文件目录
 TEMP_DIR = os.path.join(os.path.dirname(__file__), 'temp_audio')
 os.makedirs(TEMP_DIR, exist_ok=True)
+
+HTTP_CHAT_HISTORY_LIMIT = int(os.environ.get("HTTP_CHAT_HISTORY_LIMIT", "40"))
+HTTP_CHAT_HISTORIES = {}
+HTTP_CHAT_HISTORY_LOCK = threading.Lock()
 
 
 def init_system():
@@ -94,6 +100,38 @@ def init_system():
         return False
 
 
+def _get_http_chat_session_id(data):
+    """Pick a stable chat session id; fallback keeps local demos from forgetting."""
+    return (
+        data.get("session_id")
+        or data.get("conversation_id")
+        or data.get("client_id")
+        or request.headers.get("X-Session-Id")
+        or "default"
+    )
+
+
+def _load_http_chat_history(session_id, incoming_history):
+    normalized_incoming = DialoguePolicy.normalize_history(incoming_history or [])
+    with HTTP_CHAT_HISTORY_LOCK:
+        if normalized_incoming:
+            HTTP_CHAT_HISTORIES[session_id] = normalized_incoming[-HTTP_CHAT_HISTORY_LIMIT:]
+            return list(HTTP_CHAT_HISTORIES[session_id])
+        return list(HTTP_CHAT_HISTORIES.get(session_id, []))
+
+
+def _save_http_chat_turn(session_id, base_history, user_message, assistant_message):
+    updated_history = DialoguePolicy.normalize_history(base_history or [])
+    if not updated_history or updated_history[-1] != {"role": "user", "content": user_message}:
+        updated_history.append({"role": "user", "content": user_message})
+    if assistant_message:
+        updated_history.append({"role": "assistant", "content": assistant_message})
+
+    with HTTP_CHAT_HISTORY_LOCK:
+        HTTP_CHAT_HISTORIES[session_id] = updated_history[-HTTP_CHAT_HISTORY_LIMIT:]
+        return len(HTTP_CHAT_HISTORIES[session_id])
+
+
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """健康检查接口"""
@@ -126,7 +164,11 @@ def chat():
             }), 400
         
         user_message = data.get('message', '').strip()
-        history = data.get('history', [])
+        session_id = _get_http_chat_session_id(data)
+        if data.get("reset_history"):
+            with HTTP_CHAT_HISTORY_LOCK:
+                HTTP_CHAT_HISTORIES.pop(session_id, None)
+        history = _load_http_chat_history(session_id, data.get('history', []))
         mode = data.get('mode', 'normal')  # normal 或 phone
         need_audio = data.get('need_audio', False)  # 是否需要语音合成
         language_preference = data.get('language_preference', 'english')
@@ -142,36 +184,23 @@ def chat():
                 }
             }), 400
         
-        # 构建对话上下文
-        if history and len(history) > 0:
-            # 有历史记录，构建完整的对话上下文 - 使用Qwen标准格式
-            context_prompt = ""
-            for msg in history[-10:]:  # 只保留最近10条消息
-                role = msg.get('role', 'user')
-                content = msg.get('content', '')
-                if role == 'user':
-                    context_prompt += f"<|im_start|>user\n{content}<|im_end|>\n"
-                else:
-                    context_prompt += f"<|im_start|>assistant\n{content}<|im_end|>\n"
-
-            # 添加当前用户消息
-            context_prompt += f"<|im_start|>user\n{user_message}<|im_end|>\n<|im_start|>assistant\n"
-
-            # 使用上下文生成回复
-            response_text = conversation_engine.generate_response(
-                context_prompt,
-                use_context=False,  # 已经构建了完整上下文
-                allow_long_response=(mode == 'normal'),
-                medium_response=False
-            )
-        else:
-            # 无历史记录，直接生成回复
-            response_text = conversation_engine.generate_response(
-                user_message,
-                use_context=True,
-                allow_long_response=(mode == 'normal'),
-                medium_response=False
-            )
+        # 构建对话上下文。即使前端漏传 history，也用服务端会话历史兜底。
+        context_prompt = DialoguePolicy.build_chat_prompt(
+            history,
+            user_message,
+            max_history_messages=20,
+        )
+        print(
+            f"Chat session={session_id}, incoming_history={len(data.get('history', []) or [])}, "
+            f"effective_history={len(history)}, intent={DialoguePolicy.classify_user_intent(user_message, history)}"
+        )
+        response_text = conversation_engine.generate_response(
+            context_prompt,
+            use_context=False,
+            allow_long_response=(mode == 'normal'),
+            medium_response=False
+        )
+        history_count = _save_http_chat_turn(session_id, history, user_message, response_text)
         
         # 检测语言
         detected_language = LanguageUtils.detect_text_language(response_text)
@@ -219,7 +248,9 @@ def chat():
             'metadata': {
                 'tokens_used': len(response_text),  # 简化的token计数
                 'processing_time': round(processing_time, 2),
-                'language_detected': detected_language
+                'language_detected': detected_language,
+                'session_id': session_id,
+                'history_count': history_count
             }
         }
 

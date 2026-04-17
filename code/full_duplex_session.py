@@ -21,6 +21,7 @@ import soundfile as sf
 from starlette.websockets import WebSocketDisconnect
 
 from config import REALTIME_MAX_HISTORY_TURNS, REALTIME_MIN_UTTERANCE_MS, SAMPLE_RATE
+from dialogue_policy import DialoguePolicy
 from full_duplex_backends import RealtimeBackendBundle, SynthesizedSegment, split_sentences
 
 
@@ -51,6 +52,12 @@ class FullDuplexSession:
         self._turn_lock = asyncio.Lock()
         self._turn_end_sent = False
         self._closed = False
+        self._stream_text_delta = os.environ.get("REALTIME_LLM_TEXT_STREAM", "false").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
     async def run(self) -> None:
         await self._send(
@@ -63,6 +70,7 @@ class FullDuplexSession:
                     "tts_preserved": True,
                     "full_duplex": True,
                     "vad_owner": "frontend",
+                    "llm_text_stream": self._stream_text_delta,
                 },
             },
         )
@@ -137,7 +145,7 @@ class FullDuplexSession:
         print(f"[full_duplex][ASR] user_text: {transcript}")
         self.history.append({"role": "user", "content": transcript})
         self.history = self.history[-REALTIME_MAX_HISTORY_TURNS * 2 :]
-        await self._start_assistant_turn(transcript)
+        await self._prepare_assistant_turn()
         await self._send(
             "user_text",
             {
@@ -147,8 +155,9 @@ class FullDuplexSession:
                 "is_final": True,
             },
         )
+        await self._start_assistant_generation(transcript)
 
-    async def _start_assistant_turn(self, user_text: str) -> None:
+    async def _prepare_assistant_turn(self) -> None:
         async with self._turn_lock:
             await self._cancel_generation_tasks()
 
@@ -161,47 +170,79 @@ class FullDuplexSession:
             self._state = "AI_SPEAKING"
             self._tts_queue = asyncio.Queue()
             self._tts_task = asyncio.create_task(self._tts_sender_loop())
+
+    async def _start_assistant_generation(self, user_text: str) -> None:
+        async with self._turn_lock:
             self._llm_task = asyncio.create_task(self._generate_assistant_reply(user_text))
 
     async def _generate_assistant_reply(self, user_text: str) -> None:
+        turn_id = self._active_turn_id
+        message_id = self._active_message_id
+        tts_queue = self._tts_queue
         try:
-            response_text = await self.backends.llm.generate_full(self.history, user_text)
-            response_text = response_text.strip()
-            if self._state == "INTERRUPTING" or not response_text:
+            response_parts: List[str] = []
+
+            async for chunk in self.backends.llm.generate(self.history, user_text):
+                if not self._is_active_turn(turn_id, message_id):
+                    return
+
+                delta = str(chunk or "")
+                if not delta:
+                    continue
+
+                response_parts.append(delta)
+                print(f"[full_duplex][LLM] delta: {delta}", end="", flush=True)
+                if self._stream_text_delta:
+                    await self._send(
+                        "ai_text_delta",
+                        {
+                            "turn_id": turn_id,
+                            "message_id": message_id,
+                            "delta": delta,
+                            "is_final": False,
+                        },
+                    )
+
+            response_text = "".join(response_parts).strip()
+            if not self._is_active_turn(turn_id, message_id) or not response_text:
+                if self._is_active_turn(turn_id, message_id):
+                    await tts_queue.put(None)
                 return
 
+            print()
             print(f"[full_duplex][LLM] full response: {response_text}")
+            validation_prompt = self.backends.llm.build_context_prompt(self.history, user_text)
+            direct_response = DialoguePolicy.direct_response(validation_prompt)
+            if direct_response:
+                response_text = direct_response
+            if DialoguePolicy.response_needs_retry(validation_prompt, response_text):
+                print("[full_duplex][LLM] response rejected by dialogue policy, retrying once...")
+                response_text = await self.backends.llm.generate_full(self.history, user_text)
+                if DialoguePolicy.response_needs_retry(validation_prompt, response_text):
+                    response_text = DialoguePolicy.fallback_response(validation_prompt)
             await self._send(
                 "ai_text",
                 {
-                    "turn_id": self._active_turn_id,
-                    "message_id": self._active_message_id,
+                    "turn_id": turn_id,
+                    "message_id": message_id,
                     "text": response_text,
-                    "is_final": False,
+                    "is_final": True,
+                    "replace": True,
                 },
             )
 
             for segment in split_sentences(response_text):
-                if self._state == "INTERRUPTING":
+                if not self._is_active_turn(turn_id, message_id):
                     break
                 print(f"[full_duplex][TTS] queued segment: {segment}")
-                await self._tts_queue.put(segment)
+                await tts_queue.put(segment)
 
-            await self._tts_queue.put(None)
-            if self._state != "INTERRUPTING":
-                await self._send(
-                    "ai_text",
-                    {
-                        "turn_id": self._active_turn_id,
-                        "message_id": self._active_message_id,
-                        "text": response_text,
-                        "is_final": True,
-                    },
-                )
+            await tts_queue.put(None)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             await self._send("error", {"code": "LLM_FAILED", "message": str(exc)})
+            await tts_queue.put(None)
 
     async def _tts_sender_loop(self) -> None:
         try:
@@ -317,6 +358,16 @@ class FullDuplexSession:
         self._active_turn_id = None
         self._active_message_id = None
         self._state = "IDLE"
+
+    def _is_active_turn(self, turn_id: Optional[str], message_id: Optional[str]) -> bool:
+        return (
+            self._state == "AI_SPEAKING"
+            and turn_id is not None
+            and message_id is not None
+            and self._active_turn_id == turn_id
+            and self._active_message_id == message_id
+            and not self._closed
+        )
 
     async def _finalize_assistant_history(self, finish_reason: str) -> None:
         if self._turn_end_sent:

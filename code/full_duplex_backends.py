@@ -21,10 +21,12 @@ from config import (
     DEFAULT_REALTIME_QWEN_MODEL,
     DEFAULT_SENSEVOICE_MODEL,
     REALTIME_AUDIO_CHUNK_SAMPLES,
+    REALTIME_MAX_HISTORY_TURNS,
     REALTIME_TTS_AUDIO_CHUNK_SAMPLES,
     SAMPLE_RATE,
 )
 from conversation_engine import ConversationEngine
+from dialogue_policy import DialoguePolicy
 from text_processor import TextProcessor
 from tts_engine import TTSEngine
 
@@ -510,7 +512,13 @@ class SenseVoiceASRBackend:
 
         model_path = self.local_model_path if os.path.exists(self.local_model_path) else self.model_name
         try:
-            self._funasr_model = AutoModel(model=model_path, vad_model=None, punc_model=None, spk_model=None)
+            self._funasr_model = AutoModel(
+                model=model_path,
+                vad_model=None,
+                punc_model=None,
+                spk_model=None,
+                disable_update=True,
+            )
             self.backend_name = "sensevoice"
             print(f"[full_duplex] SenseVoice ASR ready: {model_path}")
         except Exception as exc:
@@ -564,15 +572,12 @@ class QwenRealtimeBackend:
             print(f"[full_duplex] Realtime Qwen init failed, legacy fallback: {DEFAULT_QWEN_MODEL}")
 
     def build_context_prompt(self, history: List[dict], user_text: str) -> str:
-        prompt_parts: List[str] = []
-        for message in history[-10:]:
-            role = message.get("role", "user")
-            content = message.get("content", "").strip()
-            if content:
-                prompt_parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
-        prompt_parts.append(f"<|im_start|>user\n{user_text}<|im_end|>")
-        prompt_parts.append("<|im_start|>assistant\n")
-        return "\n".join(prompt_parts)
+        max_history_messages = max(2, REALTIME_MAX_HISTORY_TURNS * 2)
+        return DialoguePolicy.build_chat_prompt(
+            history,
+            user_text,
+            max_history_messages=max_history_messages,
+        )
 
     async def generate(self, history: List[dict], user_text: str) -> AsyncIterator[str]:
         self.load()
@@ -582,7 +587,10 @@ class QwenRealtimeBackend:
 
         def worker() -> None:
             try:
-                for chunk in self.engine.generate_response_stream(context_prompt, use_context=False):
+                for chunk in self.engine.generate_response_stream(
+                    context_prompt,
+                    use_context=False,
+                ):
                     asyncio.run_coroutine_threadsafe(queue.put(chunk), loop)
             finally:
                 asyncio.run_coroutine_threadsafe(queue.put(None), loop)
@@ -602,7 +610,7 @@ class QwenRealtimeBackend:
         return await asyncio.to_thread(
             self.engine.generate_response,
             context_prompt,
-            512,
+            2048,
             False,
             True,
             False,

@@ -10,10 +10,10 @@ import re
 import threading
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers import TextIteratorStreamer
-from peft import PeftModel
 import torch
 
 from config import DEFAULT_QWEN_MODEL, LEARNING_KEYWORDS, GREETING_KEYWORDS
+from dialogue_policy import DialoguePolicy
 
 
 class ConversationEngine:
@@ -102,6 +102,8 @@ class ConversationEngine:
 
                 if self.lora_adapter_path:
                     if os.path.exists(self.lora_adapter_path):
+                        from peft import PeftModel
+
                         print(f"Loading LoRA adapter from: {self.lora_adapter_path}")
                         self.qwen_model = PeftModel.from_pretrained(
                             self.qwen_model,
@@ -145,7 +147,7 @@ class ConversationEngine:
             print("Conversation model initialization failed")
             return False
 
-    def generate_response(self, text_input, max_length=512, use_context=True, allow_long_response=False, medium_response=False):
+    def generate_response(self, text_input, max_length=2048, use_context=True, allow_long_response=False, medium_response=False):
         """Generate a conversational response."""
         print("Generating response...")
 
@@ -153,34 +155,15 @@ class ConversationEngine:
             return "Hello! How can I help you?"
 
         try:
-            system_msg = """You are a friendly conversational partner helping someone practice English.
-Rules:
-1. Give detailed, natural responses 
-2. Be conversational, warm and encouraging
-3. After answering, guide the conversation forward by:
-   - Asking relevant follow-up questions
-   - Showing interest in what they said
-   - Naturally extending the topic
-4. Use complete sentences and natural English expressions
-5. NEVER simulate dialogues like "Human: ... Assistant: ..."
-6. Help maintain an engaging, flowing conversation
-7. Adapt to any topic naturally - daily life, travel, business, casual chat, etc.
-8. Respond as a real person would in that situation
-
-Example:
-User: "I'm planning a trip next month"
-You: "That sounds exciting! Where are you planning to go? Have you been there before, or will this be your first time visiting?\""""
-
             if use_context:
-                prompt = f"<|im_start|>system\n{system_msg}<|im_end|>\n<|im_start|>user\n{text_input}<|im_end|>\n<|im_start|>assistant\n"
+                prompt = DialoguePolicy.build_chat_prompt([], text_input)
             else:
-                if not text_input.startswith("<|im_start|>"):
-                    prompt = f"<|im_start|>system\n{system_msg}<|im_end|>\n{text_input}"
-                else:
-                    if "<|im_start|>system" not in text_input:
-                        prompt = f"<|im_start|>system\n{system_msg}<|im_end|>\n{text_input}"
-                    else:
-                        prompt = text_input
+                prompt = DialoguePolicy.ensure_system_prompt(text_input)
+
+            direct_response = DialoguePolicy.direct_response(prompt)
+            if direct_response:
+                print(f"Generated response: {direct_response}")
+                return direct_response
 
             inputs = self.qwen_tokenizer(
                 prompt,
@@ -192,18 +175,26 @@ You: "That sounds exciting! Where are you planning to go? Have you been there be
             if torch.cuda.is_available():
                 inputs = {k: v.to("cuda") for k, v in inputs.items()}
 
-            max_tokens = 120
+            latest_user_text = DialoguePolicy.extract_latest_user_text(prompt)
+            prompt_history = DialoguePolicy.extract_prompt_history(prompt)
+            generation_config = DialoguePolicy.generation_config(latest_user_text, prompt_history)
+            max_tokens = int(os.environ.get("QWEN_MAX_NEW_TOKENS", generation_config["max_new_tokens"]))
+            temperature = float(os.environ.get("QWEN_TEMPERATURE", generation_config["temperature"]))
+            top_p = float(os.environ.get("QWEN_TOP_P", generation_config["top_p"]))
+            repetition_penalty = float(
+                os.environ.get("QWEN_REPETITION_PENALTY", generation_config["repetition_penalty"])
+            )
 
             with torch.no_grad():
                 generated_ids = self.qwen_model.generate(
                     **inputs,
                     max_new_tokens=max_tokens,
                     do_sample=True,
-                    temperature=0.7,
-                    top_p=0.9,
+                    temperature=temperature,
+                    top_p=top_p,
                     pad_token_id=self.qwen_tokenizer.eos_token_id,
                     eos_token_id=self.qwen_tokenizer.eos_token_id,
-                    repetition_penalty=1.2,
+                    repetition_penalty=repetition_penalty,
                 )
 
             response = self.qwen_tokenizer.decode(
@@ -217,6 +208,40 @@ You: "That sounds exciting! Where are you planning to go? Have you been there be
             response = re.sub(r"^(Human|Assistant|User|System)\s*:\s*", "", response, flags=re.IGNORECASE)
             response = re.sub(r"\b(Human|Assistant|User|System)\s*:\s*", "", response, flags=re.IGNORECASE)
 
+            if DialoguePolicy.response_needs_retry(prompt, response):
+                print("Generated response rejected by dialogue policy, retrying once...")
+                retry_prompt = DialoguePolicy.build_retry_prompt(prompt, response)
+                retry_inputs = self.qwen_tokenizer(
+                    retry_prompt,
+                    return_tensors="pt",
+                    max_length=max_length,
+                    truncation=True
+                )
+                if torch.cuda.is_available():
+                    retry_inputs = {k: v.to("cuda") for k, v in retry_inputs.items()}
+
+                with torch.no_grad():
+                    retry_generated_ids = self.qwen_model.generate(
+                        **retry_inputs,
+                        max_new_tokens=max_tokens,
+                        do_sample=True,
+                        temperature=min(temperature, 0.25),
+                        top_p=min(top_p, 0.8),
+                        pad_token_id=self.qwen_tokenizer.eos_token_id,
+                        eos_token_id=self.qwen_tokenizer.eos_token_id,
+                        repetition_penalty=max(repetition_penalty, 1.12),
+                    )
+
+                response = self.qwen_tokenizer.decode(
+                    retry_generated_ids[0][retry_inputs["input_ids"].shape[1]:],
+                    skip_special_tokens=True
+                ).strip()
+                response = TextProcessor.clean_response(response)
+                response = re.sub(r"^(Human|Assistant|User|System)\s*:\s*", "", response, flags=re.IGNORECASE)
+                response = re.sub(r"\b(Human|Assistant|User|System)\s*:\s*", "", response, flags=re.IGNORECASE)
+                if DialoguePolicy.response_needs_retry(prompt, response):
+                    response = DialoguePolicy.fallback_response(prompt)
+
             if not response or len(response) < 3:
                 return "Hello! How can I help you?"
 
@@ -229,37 +254,17 @@ You: "That sounds exciting! Where are you planning to go? Have you been there be
 
     def build_prompt(self, text_input, use_context=True):
         """Build a chat prompt that matches the model's current formatting."""
-        system_msg = """You are a friendly conversational partner helping someone practice English.
-Rules:
-1. Give detailed, natural responses
-2. Be conversational, warm and encouraging
-3. After answering, guide the conversation forward by:
-   - Asking relevant follow-up questions
-   - Showing interest in what they said
-   - Naturally extending the topic
-4. Use complete sentences and natural English expressions
-5. NEVER simulate dialogues like "Human: ... Assistant: ..."
-6. Help maintain an engaging, flowing conversation
-7. Adapt to any topic naturally - daily life, travel, business, casual chat, etc.
-8. Respond as a real person would in that situation"""
-
         if use_context:
-            return (
-                f"<|im_start|>system\n{system_msg}<|im_end|>\n"
-                f"<|im_start|>user\n{text_input}<|im_end|>\n"
-                "<|im_start|>assistant\n"
-            )
+            return DialoguePolicy.build_chat_prompt([], text_input)
 
         if not text_input.startswith("<|im_start|>"):
-            return f"<|im_start|>system\n{system_msg}<|im_end|>\n{text_input}"
-        if "<|im_start|>system" not in text_input:
-            return f"<|im_start|>system\n{system_msg}<|im_end|>\n{text_input}"
-        return text_input
+            return DialoguePolicy.ensure_system_prompt(text_input)
+        return DialoguePolicy.ensure_system_prompt(text_input)
 
     def generate_response_stream(
         self,
         text_input,
-        max_length=512,
+        max_length=2048,
         max_new_tokens=120,
         use_context=True,
         temperature=0.7,
@@ -287,16 +292,28 @@ Rules:
             skip_special_tokens=True,
         )
 
+        latest_user_text = DialoguePolicy.extract_latest_user_text(prompt)
+        prompt_history = DialoguePolicy.extract_prompt_history(prompt)
+        policy_config = DialoguePolicy.generation_config(latest_user_text, prompt_history)
+        effective_max_new_tokens = int(
+            os.environ.get("QWEN_STREAM_MAX_NEW_TOKENS", max(max_new_tokens, policy_config["max_new_tokens"]))
+        )
+        effective_temperature = float(os.environ.get("QWEN_STREAM_TEMPERATURE", policy_config["temperature"]))
+        effective_top_p = float(os.environ.get("QWEN_STREAM_TOP_P", policy_config["top_p"]))
+        effective_repetition_penalty = float(
+            os.environ.get("QWEN_STREAM_REPETITION_PENALTY", policy_config["repetition_penalty"])
+        )
+
         generation_kwargs = dict(
             **inputs,
             streamer=streamer,
-            max_new_tokens=max_new_tokens,
+            max_new_tokens=effective_max_new_tokens,
             do_sample=True,
-            temperature=temperature,
-            top_p=top_p,
+            temperature=effective_temperature,
+            top_p=effective_top_p,
             pad_token_id=self.qwen_tokenizer.eos_token_id,
             eos_token_id=self.qwen_tokenizer.eos_token_id,
-            repetition_penalty=1.2,
+            repetition_penalty=effective_repetition_penalty,
         )
 
         worker = threading.Thread(
