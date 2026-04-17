@@ -190,7 +190,8 @@ class FullDuplexSession:
                 if not delta:
                     continue
 
-                response_parts.append(delta)
+                current_response = "".join(response_parts)
+                response_parts.append(_join_text_delta(current_response, delta))
                 print(f"[full_duplex][LLM] delta: {delta}", end="", flush=True)
                 if self._stream_text_delta:
                     await self._send(
@@ -216,9 +217,10 @@ class FullDuplexSession:
             if direct_response:
                 response_text = direct_response
             if DialoguePolicy.response_needs_retry(validation_prompt, response_text):
-                print("[full_duplex][LLM] response rejected by dialogue policy, retrying once...")
+                print("[full_duplex][LLM] response rejected by dialogue policy, switching to validated full generation...")
                 response_text = await self.backends.llm.generate_full(self.history, user_text)
                 if DialoguePolicy.response_needs_retry(validation_prompt, response_text):
+                    print("[full_duplex][LLM] validated full generation still rejected, using dialogue fallback.")
                     response_text = DialoguePolicy.fallback_response(validation_prompt)
             await self._send(
                 "ai_text",
@@ -447,3 +449,27 @@ def _extract_ready_segments(buffer: str) -> Tuple[List[str], str]:
 def _looks_complete(text: str) -> bool:
     punctuation = "\u3002\uff01\uff1f!?.,;:\uff0c\uff1b\uff1a"
     return bool(text.strip()) and text.strip()[-1] in punctuation
+
+
+def _join_text_delta(previous_text: str, delta: str) -> str:
+    delta = str(delta or "")
+    if not previous_text or not delta:
+        return delta
+
+    previous_char = previous_text[-1]
+    next_char = delta[0]
+    if delta.startswith((" ", "\n", "\t")):
+        return delta
+    if next_char in ".,!?;:%)]}\"'":
+        return delta
+    if previous_char in " \n\t([{\"'":
+        return delta
+    if previous_char in ".!?" and _is_ascii_word_char(next_char):
+        return f" {delta}"
+    if _is_ascii_word_char(previous_char) and _is_ascii_word_char(next_char):
+        return f" {delta}"
+    return delta
+
+
+def _is_ascii_word_char(char: str) -> bool:
+    return bool(re.match(r"[A-Za-z0-9]", char))

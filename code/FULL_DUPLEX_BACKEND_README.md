@@ -26,7 +26,7 @@ uvicorn asgi_app:app --host 0.0.0.0 --port 8000
 ## 模型配置
 
 - ASR：SenseVoice，默认路径 `models/SenseVoiceSmall`，也可用 `SENSEVOICE_MODEL_PATH` 覆盖。
-- LLM：Qwen2.5-1.5B-Instruct，默认路径 `models/Qwen2.5-1.5B-Instruct`，也可用 `REALTIME_QWEN_MODEL_PATH` 覆盖。
+- LLM：Qwen3-4B，默认路径 `models/Qwen3-4B`，也可用 `REALTIME_QWEN_MODEL_PATH` 覆盖。
 - TTS：优先在后端进程内常驻加载 MOSS-TTS-Nano，失败后才尝试 Edge TTS / gTTS 网络兜底。
 
 ## MOSS-TTS-Nano 常驻接入

@@ -96,7 +96,7 @@ class TTSEngine:
         self.moss_eager_load = os.environ.get("MOSS_TTS_EAGER_LOAD", "1") != "0"
         self.moss_mode = os.environ.get("MOSS_TTS_MODE", "voice_clone")
         self.moss_voice = os.environ.get("MOSS_TTS_VOICE", "Lingyu")
-        self.moss_en_voice = os.environ.get("MOSS_TTS_EN_VOICE", "Ava")
+        self.moss_en_voice = os.environ.get("MOSS_TTS_EN_VOICE", self.moss_voice)
         self.moss_zh_voice = os.environ.get("MOSS_TTS_ZH_VOICE", self.moss_voice)
         self.moss_voice_clone_max_text_tokens = int(os.environ.get("MOSS_TTS_VOICE_CLONE_MAX_TEXT_TOKENS", "75"))
         self._moss_model = None
@@ -184,7 +184,7 @@ class TTSEngine:
             save_dir = tempfile.gettempdir()
         os.makedirs(save_dir, exist_ok=True)
 
-        language = LanguageUtils.detect_text_language(text)
+        language = self._detect_tts_language(text)
         print(f"Detected language: {language}")
 
         if self.prefer_moss_tts:
@@ -453,9 +453,20 @@ class TTSEngine:
         raise RuntimeError("MOSS-TTS-Nano direct generation returned no audio")
 
     def _moss_voice_for_text(self, text: str, language: str) -> str:
-        if language == "en":
-            return self.moss_en_voice
-        return self.moss_zh_voice
+        return self.moss_voice
+
+    @staticmethod
+    def _contains_cjk(text: str) -> bool:
+        return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+    def _detect_tts_language(self, text: str) -> str:
+        """Classify mixed TTS text conservatively for stable voice selection."""
+        raw = text or ""
+        cjk_count = len(re.findall(r"[\u4e00-\u9fff]", raw))
+        latin_words = len(re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", raw))
+        if cjk_count > 0 and latin_words > 0:
+            return "mixed"
+        return LanguageUtils.detect_text_language(raw)
 
     def _moss_max_frames_for_text(self, text: str, language: str) -> int:
         """Bound generation length so short prompts cannot drift into long noise."""

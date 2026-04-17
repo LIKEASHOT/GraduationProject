@@ -26,6 +26,7 @@ if sys.platform == 'win32':
         pass
 
 # 导入现有模块
+from config import DEFAULT_QWEN_LOCAL_DIRS
 from speech_system import CompleteSpeechSystem
 from audio_processor import AudioProcessor
 from conversation_engine import ConversationEngine
@@ -52,6 +53,21 @@ HTTP_CHAT_HISTORIES = {}
 HTTP_CHAT_HISTORY_LOCK = threading.Lock()
 
 
+def _resolve_qwen_model_path():
+    """Resolve the preferred local Qwen model path, with env override first."""
+    project_root = os.path.dirname(os.path.dirname(__file__))
+    env_path = os.environ.get("QWEN_BASE_MODEL_PATH")
+    if env_path and os.path.exists(env_path):
+        return env_path
+
+    for dirname in DEFAULT_QWEN_LOCAL_DIRS:
+        candidate = os.path.join(project_root, "models", dirname)
+        if os.path.exists(candidate):
+            return candidate
+
+    return os.path.join(project_root, "models", DEFAULT_QWEN_LOCAL_DIRS[0])
+
+
 def init_system():
     """初始化语音对话系统"""
     global speech_system, audio_processor, conversation_engine, tts_engine
@@ -70,11 +86,7 @@ def init_system():
         audio_processor.init_sensevoice()
         
         # 设置本地模型路径
-        local_model_path = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)), 
-            'models', 
-            'Qwen2.5-1.5B-Instruct'
-        )
+        local_model_path = _resolve_qwen_model_path()
         
         conversation_engine = ConversationEngine()
         # 使用本地模型路径初始化

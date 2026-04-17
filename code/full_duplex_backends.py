@@ -18,6 +18,7 @@ from typing import AsyncIterator, Iterable, List, Optional
 import numpy as np
 from config import (
     DEFAULT_QWEN_MODEL,
+    DEFAULT_QWEN_LOCAL_DIRS,
     DEFAULT_REALTIME_QWEN_MODEL,
     DEFAULT_SENSEVOICE_MODEL,
     REALTIME_AUDIO_CHUNK_SAMPLES,
@@ -37,6 +38,19 @@ def _project_root() -> str:
 
 def _default_model_path(name: str) -> str:
     return os.path.join(_project_root(), "models", name)
+
+
+def _resolve_qwen_model_path(env_var: str = "REALTIME_QWEN_MODEL_PATH") -> str:
+    env_path = os.environ.get(env_var)
+    if env_path and os.path.exists(env_path):
+        return env_path
+
+    for dirname in DEFAULT_QWEN_LOCAL_DIRS:
+        candidate = _default_model_path(dirname)
+        if os.path.exists(candidate):
+            return candidate
+
+    return _default_model_path(DEFAULT_QWEN_LOCAL_DIRS[0])
 
 
 def split_sentences(text: str) -> List[str]:
@@ -245,18 +259,19 @@ def split_sentences(text: str) -> List[str]:
     budgeted_segments: List[str] = []
     for segment in primary_segments or [normalized]:
         budgeted_segments.extend(_tts_split_by_budget(segment))
-    return _tts_enforce_final_budget(_tts_merge_short_prefixes(budgeted_segments))
+    final_segments = _tts_enforce_final_budget(_tts_merge_short_prefixes(budgeted_segments))
+    return _tts_merge_dangling_connectors(final_segments)
 
 
 def _tts_normalize_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     text = text.replace("\u201c", '"').replace("\u201d", '"')
     text = text.replace("\u2018", "'").replace("\u2019", "'")
-    return text.strip('"')
+    return text
 
 
 def _tts_clean_segment(text: str) -> str:
-    return str(text or "").strip().strip("\n\r\t ").strip('"')
+    return str(text or "").strip().strip("\n\r\t ")
 
 
 def _tts_split_by_punctuation(text: str) -> List[str]:
@@ -269,6 +284,14 @@ def _tts_split_by_punctuation(text: str) -> List[str]:
 
     for index, char in enumerate(text):
         current += char
+        previous_char = text[index - 1] if index > 0 else ""
+        if char in closers and previous_char in sentence_breaks:
+            segment = _tts_clean_segment(current)
+            if segment and not _is_punctuation_only(segment):
+                segments.append(segment)
+            current = ""
+            continue
+
         if char not in cjk_breaks and char not in sentence_breaks and char not in soft_breaks:
             continue
         if char == "." and _tts_is_decimal_or_abbreviation(text, index):
@@ -283,6 +306,8 @@ def _tts_split_by_punctuation(text: str) -> List[str]:
 
         next_char = text[index + 1] if index + 1 < len(text) else ""
         if char in soft_breaks and len(current.strip()) < 8:
+            continue
+        if next_char in closers:
             continue
         if next_char and next_char not in " \t\r\n" and next_char not in closers:
             continue
@@ -369,12 +394,12 @@ def _tts_merge_tiny_chunks(chunks: List[str]) -> List[str]:
 
 
 def _tts_split_mixed_by_tokens(text: str, max_chars: int, max_words: int) -> List[str]:
-    tokens = re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?|[\u4e00-\u9fff]+|[^\s]", text)
+    tokens = re.findall(r'"[^"]+"|[A-Za-z0-9]+(?:\'[A-Za-z0-9]+)?|[\u4e00-\u9fff]+|[^\s]', text)
     return _tts_pack_tokens(tokens, max_chars=max_chars, max_words=max_words)
 
 
 def _tts_split_latin_by_words(text: str, max_words: int, max_chars: int) -> List[str]:
-    tokens = re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?|[^\s]", text)
+    tokens = re.findall(r'"[^"]+"|[A-Za-z0-9]+(?:\'[A-Za-z0-9]+)?|[^\s]', text)
     return _tts_pack_tokens(tokens, max_chars=max_chars, max_words=max_words)
 
 
@@ -384,7 +409,7 @@ def _tts_pack_tokens(tokens: List[str], max_chars: int, max_words: int) -> List[
     current_words = 0
 
     for token in tokens:
-        token_words = 1 if re.match(r"[A-Za-z0-9]", token) else 0
+        token_words = _tts_latin_word_count(token) if re.search(r"[A-Za-z0-9]", token) else 0
         separator = " " if current and _tts_needs_space(current[-1], token[0]) else ""
         candidate = f"{current}{separator}{token}"
         should_flush = current and (len(candidate) > max_chars or current_words + token_words > max_words)
@@ -432,6 +457,10 @@ def _tts_merge_short_prefixes(segments: List[str]) -> List[str]:
         if not segment or _is_punctuation_only(segment):
             continue
 
+        if _tts_is_continuation_segment(segment) and merged:
+            merged[-1] = _tts_join_segments(merged[-1], segment)
+            continue
+
         if _tts_is_list_marker(segment):
             pending = _tts_join_segments(pending, segment) if pending else segment
             continue
@@ -453,6 +482,35 @@ def _tts_merge_short_prefixes(segments: List[str]) -> List[str]:
             merged[-1] = _tts_join_segments(merged[-1], pending)
         else:
             merged.append(pending.rstrip("\uff1a:\uff0c,\uff1b;"))
+    return merged
+
+
+def _tts_is_continuation_segment(text: str) -> bool:
+    stripped = _tts_clean_segment(text).lower()
+    return stripped.startswith(("或", "或者", "以及", "并且", "and ", "or ", "but "))
+
+
+def _tts_has_dangling_connector(text: str) -> bool:
+    stripped = _tts_clean_segment(text).lower()
+    return stripped.endswith(("或", "或者", "以及", "并且", "and", "or", "but"))
+
+
+def _tts_merge_dangling_connectors(segments: List[str]) -> List[str]:
+    merged: List[str] = []
+    index = 0
+    while index < len(segments):
+        segment = _tts_clean_segment(segments[index])
+        if (
+            segment
+            and _tts_has_dangling_connector(segment)
+            and index + 1 < len(segments)
+        ):
+            segment = _tts_join_segments(segment, segments[index + 1])
+            index += 2
+        else:
+            index += 1
+        if segment and not _is_punctuation_only(segment):
+            merged.append(segment)
     return merged
 
 
@@ -557,9 +615,7 @@ class QwenRealtimeBackend:
     def __init__(self) -> None:
         self.engine = ConversationEngine()
         self.model_name = os.environ.get("REALTIME_QWEN_MODEL_NAME", DEFAULT_REALTIME_QWEN_MODEL)
-        self.local_model_path = os.environ.get("REALTIME_QWEN_MODEL_PATH") or _default_model_path("Qwen2.5-1.5B-Instruct")
-        if not os.path.exists(self.local_model_path):
-            self.local_model_path = _default_model_path("Qwen2.5-7B-Instruct")
+        self.local_model_path = _resolve_qwen_model_path("REALTIME_QWEN_MODEL_PATH")
         self.loaded = False
 
     def load(self) -> None:
@@ -581,6 +637,10 @@ class QwenRealtimeBackend:
 
     async def generate(self, history: List[dict], user_text: str) -> AsyncIterator[str]:
         self.load()
+        if os.environ.get("REALTIME_LLM_TEXT_STREAM", "false").lower() not in {"1", "true", "yes", "on"}:
+            yield await self.generate_full(history, user_text)
+            return
+
         context_prompt = self.build_context_prompt(history, user_text)
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
@@ -592,6 +652,8 @@ class QwenRealtimeBackend:
                     use_context=False,
                 ):
                     asyncio.run_coroutine_threadsafe(queue.put(chunk), loop)
+            except Exception as exc:
+                print(f"[full_duplex] Realtime Qwen stream failed: {exc}")
             finally:
                 asyncio.run_coroutine_threadsafe(queue.put(None), loop)
 

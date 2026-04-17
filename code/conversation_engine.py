@@ -159,21 +159,12 @@ class ConversationEngine:
                 prompt = DialoguePolicy.build_chat_prompt([], text_input)
             else:
                 prompt = DialoguePolicy.ensure_system_prompt(text_input)
+            prompt = self._disable_qwen_thinking_if_supported(prompt)
 
             direct_response = DialoguePolicy.direct_response(prompt)
             if direct_response:
                 print(f"Generated response: {direct_response}")
                 return direct_response
-
-            inputs = self.qwen_tokenizer(
-                prompt,
-                return_tensors="pt",
-                max_length=max_length,
-                truncation=True
-            )
-
-            if torch.cuda.is_available():
-                inputs = {k: v.to("cuda") for k, v in inputs.items()}
 
             latest_user_text = DialoguePolicy.extract_latest_user_text(prompt)
             prompt_history = DialoguePolicy.extract_prompt_history(prompt)
@@ -185,62 +176,23 @@ class ConversationEngine:
                 os.environ.get("QWEN_REPETITION_PENALTY", generation_config["repetition_penalty"])
             )
 
-            with torch.no_grad():
-                generated_ids = self.qwen_model.generate(
-                    **inputs,
-                    max_new_tokens=max_tokens,
-                    do_sample=True,
-                    temperature=temperature,
-                    top_p=top_p,
-                    pad_token_id=self.qwen_tokenizer.eos_token_id,
-                    eos_token_id=self.qwen_tokenizer.eos_token_id,
-                    repetition_penalty=repetition_penalty,
-                )
-
-            response = self.qwen_tokenizer.decode(
-                generated_ids[0][inputs["input_ids"].shape[1]:],
-                skip_special_tokens=True
-            ).strip()
-
-            from text_processor import TextProcessor
-            response = TextProcessor.clean_response(response)
-
-            response = re.sub(r"^(Human|Assistant|User|System)\s*:\s*", "", response, flags=re.IGNORECASE)
-            response = re.sub(r"\b(Human|Assistant|User|System)\s*:\s*", "", response, flags=re.IGNORECASE)
-
-            if DialoguePolicy.response_needs_retry(prompt, response):
-                print("Generated response rejected by dialogue policy, retrying once...")
-                retry_prompt = DialoguePolicy.build_retry_prompt(prompt, response)
-                retry_inputs = self.qwen_tokenizer(
-                    retry_prompt,
-                    return_tensors="pt",
-                    max_length=max_length,
-                    truncation=True
-                )
-                if torch.cuda.is_available():
-                    retry_inputs = {k: v.to("cuda") for k, v in retry_inputs.items()}
-
-                with torch.no_grad():
-                    retry_generated_ids = self.qwen_model.generate(
-                        **retry_inputs,
-                        max_new_tokens=max_tokens,
-                        do_sample=True,
-                        temperature=min(temperature, 0.25),
-                        top_p=min(top_p, 0.8),
-                        pad_token_id=self.qwen_tokenizer.eos_token_id,
-                        eos_token_id=self.qwen_tokenizer.eos_token_id,
-                        repetition_penalty=max(repetition_penalty, 1.12),
-                    )
-
-                response = self.qwen_tokenizer.decode(
-                    retry_generated_ids[0][retry_inputs["input_ids"].shape[1]:],
-                    skip_special_tokens=True
-                ).strip()
-                response = TextProcessor.clean_response(response)
-                response = re.sub(r"^(Human|Assistant|User|System)\s*:\s*", "", response, flags=re.IGNORECASE)
-                response = re.sub(r"\b(Human|Assistant|User|System)\s*:\s*", "", response, flags=re.IGNORECASE)
-                if DialoguePolicy.response_needs_retry(prompt, response):
-                    response = DialoguePolicy.fallback_response(prompt)
+            response = self._generate_text_from_prompt(
+                prompt,
+                max_length=max_length,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+            )
+            response = self._repair_response_with_policy(
+                prompt,
+                response,
+                max_length=max_length,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+            )
 
             if not response or len(response) < 3:
                 return "Hello! How can I help you?"
@@ -251,6 +203,101 @@ class ConversationEngine:
         except Exception as exc:
             print(f"Response generation failed: {exc}")
             return "Hello! How can I help you?"
+
+    def _generate_text_from_prompt(
+        self,
+        prompt,
+        max_length,
+        max_tokens,
+        temperature,
+        top_p,
+        repetition_penalty,
+    ):
+        """Run one model generation pass and return cleaned assistant text."""
+        prompt = self._disable_qwen_thinking_if_supported(prompt)
+        inputs = self.qwen_tokenizer(
+            prompt,
+            return_tensors="pt",
+            max_length=max_length,
+            truncation=True,
+        )
+
+        if torch.cuda.is_available():
+            inputs = {k: v.to("cuda") for k, v in inputs.items()}
+
+        with torch.no_grad():
+            generated_ids = self.qwen_model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                do_sample=True,
+                temperature=temperature,
+                top_p=top_p,
+                pad_token_id=self.qwen_tokenizer.eos_token_id,
+                eos_token_id=self.qwen_tokenizer.eos_token_id,
+                repetition_penalty=repetition_penalty,
+            )
+
+        response = self.qwen_tokenizer.decode(
+            generated_ids[0][inputs["input_ids"].shape[1]:],
+            skip_special_tokens=True,
+        ).strip()
+        return self._clean_generated_response(response)
+
+    def _repair_response_with_policy(
+        self,
+        prompt,
+        response,
+        max_length,
+        max_tokens,
+        temperature,
+        top_p,
+        repetition_penalty,
+    ):
+        """Retry policy-rejected responses before using deterministic fallback."""
+        max_retries = self._policy_retry_count()
+        for retry_index in range(1, max_retries + 1):
+            if not DialoguePolicy.response_needs_retry(prompt, response):
+                return response
+
+            print(
+                "Generated response rejected by dialogue policy, "
+                f"retry {retry_index}/{max_retries}..."
+            )
+            retry_prompt = DialoguePolicy.build_retry_prompt(prompt, response)
+            response = self._generate_text_from_prompt(
+                retry_prompt,
+                max_length=max_length,
+                max_tokens=max_tokens,
+                temperature=min(temperature, 0.25),
+                top_p=min(top_p, 0.8),
+                repetition_penalty=max(repetition_penalty, 1.12),
+            )
+
+        if DialoguePolicy.response_needs_retry(prompt, response):
+            print(
+                "Generated response rejected after "
+                f"{max_retries} retries, using dialogue fallback."
+            )
+            return DialoguePolicy.fallback_response(prompt)
+        return response
+
+    @staticmethod
+    def _policy_retry_count():
+        """Default to at least three repair attempts before fallback."""
+        try:
+            configured = int(os.environ.get("DIALOGUE_POLICY_MAX_RETRIES", "3"))
+        except ValueError:
+            configured = 3
+        return max(3, configured)
+
+    @staticmethod
+    def _clean_generated_response(response):
+        from text_processor import TextProcessor
+
+        cleaned = TextProcessor.clean_response(response)
+        cleaned = re.sub(r"^(Human|Assistant|User|System)\s*:\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(Human|Assistant|User|System)\s*:\s*", "", cleaned, flags=re.IGNORECASE)
+        return cleaned.strip()
 
     def build_prompt(self, text_input, use_context=True):
         """Build a chat prompt that matches the model's current formatting."""
@@ -276,6 +323,7 @@ class ConversationEngine:
             return
 
         prompt = self.build_prompt(text_input, use_context=use_context)
+        prompt = self._disable_qwen_thinking_if_supported(prompt)
         inputs = self.qwen_tokenizer(
             prompt,
             return_tensors="pt",
@@ -290,6 +338,7 @@ class ConversationEngine:
             self.qwen_tokenizer,
             skip_prompt=True,
             skip_special_tokens=True,
+            timeout=float(os.environ.get("QWEN_STREAM_TIMEOUT", "30")),
         )
 
         latest_user_text = DialoguePolicy.extract_latest_user_text(prompt)
@@ -316,14 +365,59 @@ class ConversationEngine:
             repetition_penalty=effective_repetition_penalty,
         )
 
-        worker = threading.Thread(
-            target=self.qwen_model.generate,
-            kwargs=generation_kwargs,
-            daemon=True,
-        )
+        def generation_worker():
+            try:
+                self.qwen_model.generate(**generation_kwargs)
+            except Exception as exc:
+                print(f"Streaming response generation failed: {exc}")
+
+        worker = threading.Thread(target=generation_worker, daemon=True)
         worker.start()
 
-        for piece in streamer:
-            cleaned_piece = piece.replace("<|im_end|>", "")
-            if cleaned_piece:
-                yield cleaned_piece
+        try:
+            for piece in streamer:
+                from text_processor import TextProcessor
+                cleaned_piece = TextProcessor.remove_thinking(piece.replace("<|im_end|>", ""))
+                if cleaned_piece:
+                    yield cleaned_piece
+        except Exception as exc:
+            print(f"Streaming response iterator stopped: {exc}")
+
+    def _disable_qwen_thinking_if_supported(self, prompt: str) -> str:
+        """Use Qwen3 chat template switch when the installed tokenizer supports it."""
+        if os.environ.get("QWEN_ENABLE_THINKING", "0").lower() in {"1", "true", "yes", "on"}:
+            return prompt
+        if not prompt or not prompt.startswith("<|im_start|>"):
+            return prompt
+        if not hasattr(self.qwen_tokenizer, "apply_chat_template"):
+            return prompt
+
+        try:
+            messages = self._parse_chat_prompt(prompt)
+            if not messages:
+                return prompt
+            return self.qwen_tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            return prompt
+        except Exception as exc:
+            print(f"Qwen thinking disable skipped: {exc}")
+            return prompt
+
+    @staticmethod
+    def _parse_chat_prompt(prompt: str) -> list:
+        matches = re.findall(r"<\|im_start\|>(system|user|assistant)\n(.*?)<\|im_end\|>", prompt, flags=re.DOTALL)
+        messages = [
+            {"role": role, "content": content.strip()}
+            for role, content in matches
+            if content.strip()
+        ]
+        if prompt.rstrip().endswith("<|im_start|>assistant"):
+            return messages
+        if messages and messages[-1]["role"] == "assistant" and not messages[-1]["content"]:
+            messages = messages[:-1]
+        return messages

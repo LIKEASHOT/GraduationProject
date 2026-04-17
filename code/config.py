@@ -10,8 +10,14 @@ CHANNELS = 1
 CHUNK_SIZE = 1024
 
 # 模型配置
-DEFAULT_QWEN_MODEL = "Qwen/Qwen2.5-7B-Instruct"
-DEFAULT_REALTIME_QWEN_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+DEFAULT_QWEN_MODEL = "Qwen/Qwen3-4B"
+DEFAULT_REALTIME_QWEN_MODEL = "Qwen/Qwen3-4B"
+DEFAULT_QWEN_LOCAL_DIRS = [
+    "Qwen3-4B",
+    "Qwen3-4B-Instruct",
+    "Qwen2.5-1.5B-Instruct",
+    "Qwen2.5-7B-Instruct",
+]
 DEFAULT_SENSEVOICE_MODEL = "iic/SenseVoiceSmall"
 DEFAULT_SILERO_VAD_REPO = "snakers4/silero-vad"
 

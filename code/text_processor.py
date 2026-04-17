@@ -20,6 +20,8 @@ class TextProcessor:
             response: 原始回复文本
             allow_long_response: 是否允许长回复（未使用）
         """
+        response = TextProcessor.remove_thinking(response)
+
         # 移除Qwen模型的特殊标记
         response = re.sub(r'<\|im_start\|>.*?<\|im_end\|>', '', response, flags=re.DOTALL)
         response = re.sub(r'<\|im_start\|>.*', '', response)
@@ -49,9 +51,19 @@ class TextProcessor:
     @staticmethod
     def clean_response(response):
         """清理回复文本 - 基本清理"""
+        response = TextProcessor.remove_thinking(response)
         # 移除多余的换行和空格
         response = response.replace('\n', ' ').strip()
         # 移除重复的空格
         while '  ' in response:
             response = response.replace('  ', ' ')
         return response
+
+    @staticmethod
+    def remove_thinking(response):
+        """Remove Qwen3 thinking traces before returning text to clients."""
+        response = str(response or "")
+        response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL | re.IGNORECASE)
+        response = re.sub(r'<think>.*', '', response, flags=re.DOTALL | re.IGNORECASE)
+        response = re.sub(r'</think>', '', response, flags=re.IGNORECASE)
+        return response.strip()
