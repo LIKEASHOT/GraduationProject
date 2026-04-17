@@ -79,6 +79,7 @@ Thumbs.db
 
 # Distillation artifacts
 distill/
+接口文档/
 
 # Keep the repository lightweight for code sync only
 benchmark/
