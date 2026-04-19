@@ -21,6 +21,7 @@ class TextProcessor:
             allow_long_response: 是否允许长回复（未使用）
         """
         response = TextProcessor.remove_thinking(response)
+        response = TextProcessor.remove_markdown_formatting(response)
 
         # 移除Qwen模型的特殊标记
         response = re.sub(r'<\|im_start\|>.*?<\|im_end\|>', '', response, flags=re.DOTALL)
@@ -52,6 +53,7 @@ class TextProcessor:
     def clean_response(response):
         """清理回复文本 - 基本清理"""
         response = TextProcessor.remove_thinking(response)
+        response = TextProcessor.remove_markdown_formatting(response)
         # 移除多余的换行和空格
         response = response.replace('\n', ' ').strip()
         # 移除重复的空格
@@ -66,4 +68,16 @@ class TextProcessor:
         response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL | re.IGNORECASE)
         response = re.sub(r'<think>.*', '', response, flags=re.DOTALL | re.IGNORECASE)
         response = re.sub(r'</think>', '', response, flags=re.IGNORECASE)
+        return response.strip()
+
+    @staticmethod
+    def remove_markdown_formatting(response):
+        """Strip lightweight Markdown markers that are awkward in chat/TTS."""
+        response = str(response or "")
+        response = re.sub(r"\*\*(.*?)\*\*", r"\1", response)
+        response = re.sub(r"__(.*?)__", r"\1", response)
+        response = re.sub(r"(?<!\*)\*(?!\*)(.*?)\*(?!\*)", r"\1", response)
+        response = re.sub(r"`([^`]+)`", r"\1", response)
+        response = re.sub(r"(?m)^\s*[-*]\s+", "", response)
+        response = re.sub(r"(?m)^\s*#{1,6}\s*", "", response)
         return response.strip()

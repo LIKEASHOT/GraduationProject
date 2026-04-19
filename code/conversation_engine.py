@@ -8,12 +8,23 @@ Supports loading a local base model and optionally attaching a LoRA adapter.
 import os
 import re
 import threading
+import traceback
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers import TextIteratorStreamer
 import torch
 
 from config import DEFAULT_QWEN_MODEL, LEARNING_KEYWORDS, GREETING_KEYWORDS
 from dialogue_policy import DialoguePolicy
+
+
+def _env_lora_enabled():
+    raw_variant = (
+        os.environ.get("QWEN_MODEL_VARIANT")
+        or os.environ.get("QWEN_DEFAULT_MODEL_VARIANT")
+        or os.environ.get("BACKEND_MODEL_VARIANT")
+        or ""
+    )
+    return str(raw_variant).strip().lower() in {"lora", "finetuned", "fine_tuned", "ft", "sft"}
 
 
 class ConversationEngine:
@@ -39,19 +50,16 @@ class ConversationEngine:
             and os.path.exists(os.environ.get("QWEN_BASE_MODEL_PATH"))
         ):
             self.local_model_path = os.environ.get("QWEN_BASE_MODEL_PATH")
-        # LoRA adapter 已禁用，使用原始基础模型
-        # if lora_adapter_path:
-        #     self.lora_adapter_path = lora_adapter_path
-        # elif not self.lora_adapter_path:
-        #     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        #     env_adapter_path = os.environ.get("QWEN_LORA_ADAPTER_PATH")
-        #     default_adapter_path = os.path.join(project_root, "distill", "output", "lora_sft_v7")
-        #     candidate_adapter_path = env_adapter_path or default_adapter_path
-        #     if os.path.exists(candidate_adapter_path):
-        #         self.lora_adapter_path = candidate_adapter_path
-        self.lora_adapter_path = None
+        if lora_adapter_path:
+            self.lora_adapter_path = lora_adapter_path
+        elif _env_lora_enabled() and os.environ.get("QWEN_LORA_ADAPTER_PATH"):
+            self.lora_adapter_path = os.environ.get("QWEN_LORA_ADAPTER_PATH")
+        else:
+            self.lora_adapter_path = None
 
         print("Starting Qwen model initialization...")
+        if self.lora_adapter_path:
+            print(f"LoRA adapter requested: {self.lora_adapter_path}")
 
         if self.local_model_path and os.path.exists(self.local_model_path):
             print(f"Using local base model path: {self.local_model_path}")
@@ -63,13 +71,10 @@ class ConversationEngine:
                     print(f"CUDA version: {torch.version.cuda}")
                     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
+                # LoRA adapters are weight deltas. Keep the tokenizer tied to the
+                # base model to avoid adapter-side tokenizer_config incompatibilities.
                 tokenizer_path = self.local_model_path
-                if (
-                    self.lora_adapter_path
-                    and os.path.exists(self.lora_adapter_path)
-                    and os.path.exists(os.path.join(self.lora_adapter_path, "tokenizer_config.json"))
-                ):
-                    tokenizer_path = self.lora_adapter_path
+                print(f"Using tokenizer path: {tokenizer_path}")
 
                 self.qwen_tokenizer = AutoTokenizer.from_pretrained(
                     tokenizer_path,
@@ -113,11 +118,16 @@ class ConversationEngine:
                         print("LoRA adapter loaded successfully")
                     else:
                         print(f"LoRA adapter path not found: {self.lora_adapter_path}")
+                        return False
 
                 self.qwen_model.eval()
                 return True
             except Exception as exc:
                 print(f"Local model loading failed: {exc}")
+                traceback.print_exc()
+                if self.lora_adapter_path:
+                    print("LoRA model initialization failed; not falling back to remote base model.")
+                    return False
                 print("Falling back to remote model...")
 
         try:
@@ -254,6 +264,9 @@ class ConversationEngine:
         repetition_penalty,
     ):
         """Retry policy-rejected responses before using deterministic fallback."""
+        if os.environ.get("DIALOGUE_POLICY_REPAIR_ENABLED", "1").lower() not in {"1", "true", "yes", "on"}:
+            return response
+
         max_retries = self._policy_retry_count()
         for retry_index in range(1, max_retries + 1):
             if not DialoguePolicy.response_needs_retry(prompt, response):
@@ -263,13 +276,19 @@ class ConversationEngine:
                 "Generated response rejected by dialogue policy, "
                 f"retry {retry_index}/{max_retries}..."
             )
+            print(f"Rejected draft: {response[:240]}")
             retry_prompt = DialoguePolicy.build_retry_prompt(prompt, response)
+            latest_user_text = DialoguePolicy.extract_latest_user_text(prompt)
+            prompt_history = DialoguePolicy.extract_prompt_history(prompt)
+            retry_mode = DialoguePolicy.classify_user_intent(latest_user_text, prompt_history)
+            retry_temperature = max(temperature, 0.45) if retry_mode == "roleplay" else min(temperature, 0.25)
+            retry_top_p = max(top_p, 0.85) if retry_mode == "roleplay" else min(top_p, 0.8)
             response = self._generate_text_from_prompt(
                 retry_prompt,
                 max_length=max_length,
                 max_tokens=max_tokens,
-                temperature=min(temperature, 0.25),
-                top_p=min(top_p, 0.8),
+                temperature=retry_temperature,
+                top_p=retry_top_p,
                 repetition_penalty=max(repetition_penalty, 1.12),
             )
 

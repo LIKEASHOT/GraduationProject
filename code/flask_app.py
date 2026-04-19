@@ -26,7 +26,7 @@ if sys.platform == 'win32':
         pass
 
 # 导入现有模块
-from config import DEFAULT_QWEN_LOCAL_DIRS
+from config import DEFAULT_QWEN_LOCAL_DIRS, DEFAULT_QWEN_LORA_DIRS
 from speech_system import CompleteSpeechSystem
 from audio_processor import AudioProcessor
 from conversation_engine import ConversationEngine
@@ -42,7 +42,9 @@ CORS(app)  # 启用CORS支持跨域请求
 speech_system = None
 audio_processor = None
 conversation_engine = None
+lora_conversation_engine = None
 tts_engine = None
+active_model_variant = "base"
 
 # 创建临时文件目录
 TEMP_DIR = os.path.join(os.path.dirname(__file__), 'temp_audio')
@@ -51,6 +53,7 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 HTTP_CHAT_HISTORY_LIMIT = int(os.environ.get("HTTP_CHAT_HISTORY_LIMIT", "40"))
 HTTP_CHAT_HISTORIES = {}
 HTTP_CHAT_HISTORY_LOCK = threading.Lock()
+LORA_ENGINE_LOCK = threading.Lock()
 
 
 def _resolve_qwen_model_path():
@@ -68,9 +71,87 @@ def _resolve_qwen_model_path():
     return os.path.join(project_root, "models", DEFAULT_QWEN_LOCAL_DIRS[0])
 
 
+def _resolve_qwen_lora_path():
+    """Resolve the preferred local Qwen LoRA adapter path, with env override first."""
+    project_root = os.path.dirname(os.path.dirname(__file__))
+    env_path = os.environ.get("QWEN_LORA_ADAPTER_PATH")
+    if env_path and os.path.exists(env_path):
+        return env_path
+
+    for dirname in DEFAULT_QWEN_LORA_DIRS:
+        candidate = os.path.join(project_root, "models", dirname)
+        if os.path.exists(candidate):
+            return candidate
+
+    return os.path.join(project_root, "models", DEFAULT_QWEN_LORA_DIRS[0])
+
+
+def _normalize_model_variant(raw_variant):
+    variant = str(raw_variant or "base").strip().lower()
+    if variant in {"lora", "finetuned", "fine_tuned", "ft", "sft"}:
+        return "lora"
+    return "base"
+
+
+def _configured_model_variant():
+    raw_variant = (
+        os.environ.get("QWEN_MODEL_VARIANT")
+        or os.environ.get("QWEN_DEFAULT_MODEL_VARIANT")
+        or os.environ.get("BACKEND_MODEL_VARIANT")
+        or "base"
+    )
+    return _normalize_model_variant(raw_variant)
+
+
+def _get_model_variant(data):
+    """Normalize model variant from frontend request fields."""
+    explicit_keys = {"model_variant", "model_mode", "llm_mode", "model", "use_lora"}
+    if not any(key in data for key in explicit_keys):
+        return active_model_variant
+
+    raw_variant = (
+        data.get("model_variant")
+        or data.get("model_mode")
+        or data.get("llm_mode")
+        or data.get("model")
+        or ""
+    )
+    if data.get("use_lora") is True:
+        raw_variant = "lora"
+    return _normalize_model_variant(raw_variant)
+
+
+def _get_conversation_engine_for_variant(model_variant):
+    """Return the base engine or lazily initialize the LoRA engine."""
+    global lora_conversation_engine
+    if model_variant == active_model_variant:
+        return conversation_engine
+    if model_variant != "lora":
+        raise RuntimeError(
+            f"Backend started with model_variant={active_model_variant}; "
+            "base model is not loaded as a separate switchable engine."
+        )
+
+    with LORA_ENGINE_LOCK:
+        if lora_conversation_engine is not None:
+            return lora_conversation_engine
+
+        local_model_path = _resolve_qwen_model_path()
+        lora_adapter_path = _resolve_qwen_lora_path()
+        if not os.path.exists(lora_adapter_path):
+            raise RuntimeError(f"LoRA adapter path not found: {lora_adapter_path}")
+
+        engine = ConversationEngine()
+        if not engine.init_model(local_model_path=local_model_path, lora_adapter_path=lora_adapter_path):
+            raise RuntimeError(f"Failed to initialize LoRA model: {lora_adapter_path}")
+
+        lora_conversation_engine = engine
+        return lora_conversation_engine
+
+
 def init_system():
     """初始化语音对话系统"""
-    global speech_system, audio_processor, conversation_engine, tts_engine
+    global speech_system, audio_processor, conversation_engine, lora_conversation_engine, tts_engine, active_model_variant
 
     if audio_processor is not None and conversation_engine is not None and tts_engine is not None:
         print("Flask backend components already initialized, skipping duplicate startup")
@@ -87,10 +168,18 @@ def init_system():
         
         # 设置本地模型路径
         local_model_path = _resolve_qwen_model_path()
+        active_model_variant = _configured_model_variant()
+        lora_adapter_path = _resolve_qwen_lora_path() if active_model_variant == "lora" else None
+        print(f"Qwen backend model variant: {active_model_variant}")
+        if lora_adapter_path:
+            print(f"Qwen LoRA adapter path: {lora_adapter_path}")
         
         conversation_engine = ConversationEngine()
         # 使用本地模型路径初始化
-        conversation_engine.init_model(local_model_path=local_model_path)
+        if not conversation_engine.init_model(local_model_path=local_model_path, lora_adapter_path=lora_adapter_path):
+            raise RuntimeError(f"Failed to initialize Qwen model variant: {active_model_variant}")
+        if active_model_variant == "lora":
+            lora_conversation_engine = conversation_engine
         
         # 在服务器环境下优先使用本地TTS模型
         import sys
@@ -144,6 +233,38 @@ def _save_http_chat_turn(session_id, base_history, user_message, assistant_messa
         return len(HTTP_CHAT_HISTORIES[session_id])
 
 
+def _build_system_prompt_for_mode(mode):
+    """Build the backend system prompt template used by the requested chat mode."""
+    normalized_mode = (mode or "normal").strip().lower()
+    if normalized_mode not in {"normal", "phone"}:
+        return "", normalized_mode
+
+    if normalized_mode == "phone":
+        prompt = (
+            "You are a patient English speaking coach for Chinese learners in a spoken phone-style practice mode.\n"
+            "Help the user practice English through natural spoken conversation, correction, explanation, translation, and role-play.\n"
+            "Keep turns short, natural, and easy to speak aloud.\n"
+            "Treat short replies like OK and sure as confirmations.\n"
+            "Preserve the current conversation context and move the practice forward naturally.\n"
+            "If the user asks to translate this sentence, that sentence, or what you just said, translate the referenced assistant text from context instead of translating the command itself.\n"
+            "Ask only one useful question each turn.\n"
+            "Output only the assistant reply."
+        )
+    else:
+        prompt = (
+            "You are a patient English speaking coach for Chinese learners.\n"
+            "Help the user practice English through natural conversation, correction, explanation, translation, and role-play.\n"
+            "Respect the current conversation context and the user's requested scenario or task.\n"
+            "Treat short replies like OK and sure as confirmations.\n"
+            "Do not mechanically repeat or paraphrase the user's answer; use brief acknowledgement only.\n"
+            "If the user asks to translate this sentence, that sentence, or what you just said, translate the referenced assistant text from context instead of translating the command itself.\n"
+            "Ask only one useful question each turn.\n"
+            "Keep replies natural and concise.\n"
+            "Output only the assistant reply."
+        )
+    return prompt, normalized_mode
+
+
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """健康检查接口"""
@@ -151,6 +272,44 @@ def health_check():
         'success': True,
         'message': 'EchoSage API服务运行正常',
         'timestamp': time.time()
+    })
+
+
+@app.route('/api/system-prompt', methods=['GET', 'POST'])
+def system_prompt():
+    """Return the real backend system prompt template for the requested mode."""
+    data = request.get_json(silent=True) or {}
+    mode = data.get("mode") if request.method == "POST" else request.args.get("mode")
+    mode = mode or "normal"
+    prompt, normalized_mode = _build_system_prompt_for_mode(mode)
+    if normalized_mode not in {"normal", "phone"}:
+        return jsonify({
+            "success": False,
+            "error": {
+                "code": "INVALID_MODE",
+                "message": "mode must be normal or phone",
+            }
+        }), 400
+    if not prompt:
+        return jsonify({
+            "success": False,
+            "error": {
+                "code": "SYSTEM_PROMPT_NOT_FOUND",
+                "message": "failed to build system prompt",
+            }
+        }), 500
+
+    history = DialoguePolicy.normalize_history(data.get("history", [])) if request.method == "POST" else []
+    return jsonify({
+        "success": True,
+        "mode": normalized_mode,
+        "system_prompt": prompt,
+        "history_count": len(history),
+        "data": {
+            "mode": normalized_mode,
+            "system_prompt": prompt,
+            "history_count": len(history),
+        }
     })
 
 
@@ -182,6 +341,7 @@ def chat():
                 HTTP_CHAT_HISTORIES.pop(session_id, None)
         history = _load_http_chat_history(session_id, data.get('history', []))
         mode = data.get('mode', 'normal')  # normal 或 phone
+        model_variant = _get_model_variant(data)
         need_audio = data.get('need_audio', False)  # 是否需要语音合成
         language_preference = data.get('language_preference', 'english')
         max_tokens = data.get('max_tokens', None)
@@ -204,9 +364,11 @@ def chat():
         )
         print(
             f"Chat session={session_id}, incoming_history={len(data.get('history', []) or [])}, "
-            f"effective_history={len(history)}, intent={DialoguePolicy.classify_user_intent(user_message, history)}"
+            f"effective_history={len(history)}, intent={DialoguePolicy.classify_user_intent(user_message, history)}, "
+            f"model_variant={model_variant}"
         )
-        response_text = conversation_engine.generate_response(
+        selected_conversation_engine = _get_conversation_engine_for_variant(model_variant)
+        response_text = selected_conversation_engine.generate_response(
             context_prompt,
             use_context=False,
             allow_long_response=(mode == 'normal'),
@@ -262,7 +424,8 @@ def chat():
                 'processing_time': round(processing_time, 2),
                 'language_detected': detected_language,
                 'session_id': session_id,
-                'history_count': history_count
+                'history_count': history_count,
+                'model_variant': model_variant
             }
         }
 

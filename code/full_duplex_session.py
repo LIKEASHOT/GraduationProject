@@ -25,6 +25,22 @@ from dialogue_policy import DialoguePolicy
 from full_duplex_backends import RealtimeBackendBundle, SynthesizedSegment, split_sentences
 
 
+def _normalize_model_variant(payload: dict, default_variant: str = "base") -> str:
+    raw_variant = (
+        payload.get("model_variant")
+        or payload.get("model_mode")
+        or payload.get("llm_mode")
+        or payload.get("model")
+        or default_variant
+    )
+    if payload.get("use_lora") is True:
+        raw_variant = "lora"
+    variant = str(raw_variant or "base").strip().lower()
+    if variant in {"lora", "finetuned", "fine_tuned", "ft", "sft"}:
+        return "lora"
+    return "base"
+
+
 class FullDuplexSession:
     """One websocket session with frontend-driven VAD boundaries."""
 
@@ -52,6 +68,7 @@ class FullDuplexSession:
         self._turn_lock = asyncio.Lock()
         self._turn_end_sent = False
         self._closed = False
+        self._model_variant = getattr(self.backends.llm, "default_model_variant", "base")
         self._stream_text_delta = os.environ.get("REALTIME_LLM_TEXT_STREAM", "false").lower() in {
             "1",
             "true",
@@ -71,7 +88,9 @@ class FullDuplexSession:
                     "full_duplex": True,
                     "vad_owner": "frontend",
                     "llm_text_stream": self._stream_text_delta,
+                    "model_variants": ["base", "lora"],
                 },
+                "model_variant": self._model_variant,
             },
         )
 
@@ -100,7 +119,14 @@ class FullDuplexSession:
         elif event == "end_call":
             self._ended = True
         elif event == "session_start":
-            await self._send("session_ready", {"session_id": self.session_id})
+            self._model_variant = _normalize_model_variant(payload, self._model_variant)
+            await self._send(
+                "session_ready",
+                {
+                    "session_id": self.session_id,
+                    "model_variant": self._model_variant,
+                },
+            )
         else:
             await self._send("error", {"code": "UNKNOWN_EVENT", "message": f"Unsupported event: {event}"})
 
@@ -182,7 +208,7 @@ class FullDuplexSession:
         try:
             response_parts: List[str] = []
 
-            async for chunk in self.backends.llm.generate(self.history, user_text):
+            async for chunk in self.backends.llm.generate(self.history, user_text, model_variant=self._model_variant):
                 if not self._is_active_turn(turn_id, message_id):
                     return
 
@@ -212,16 +238,21 @@ class FullDuplexSession:
 
             print()
             print(f"[full_duplex][LLM] full response: {response_text}")
-            validation_prompt = self.backends.llm.build_context_prompt(self.history, user_text)
-            direct_response = DialoguePolicy.direct_response(validation_prompt)
-            if direct_response:
-                response_text = direct_response
-            if DialoguePolicy.response_needs_retry(validation_prompt, response_text):
-                print("[full_duplex][LLM] response rejected by dialogue policy, switching to validated full generation...")
-                response_text = await self.backends.llm.generate_full(self.history, user_text)
+            if os.environ.get("DIALOGUE_POLICY_REPAIR_ENABLED", "1").lower() in {"1", "true", "yes", "on"}:
+                validation_prompt = self.backends.llm.build_context_prompt(self.history, user_text)
+                direct_response = DialoguePolicy.direct_response(validation_prompt)
+                if direct_response:
+                    response_text = direct_response
                 if DialoguePolicy.response_needs_retry(validation_prompt, response_text):
-                    print("[full_duplex][LLM] validated full generation still rejected, using dialogue fallback.")
-                    response_text = DialoguePolicy.fallback_response(validation_prompt)
+                    print("[full_duplex][LLM] response rejected by dialogue policy, switching to validated full generation...")
+                    response_text = await self.backends.llm.generate_full(
+                        self.history,
+                        user_text,
+                        model_variant=self._model_variant,
+                    )
+                    if DialoguePolicy.response_needs_retry(validation_prompt, response_text):
+                        print("[full_duplex][LLM] validated full generation still rejected, using dialogue fallback.")
+                        response_text = DialoguePolicy.fallback_response(validation_prompt)
             await self._send(
                 "ai_text",
                 {
@@ -230,6 +261,7 @@ class FullDuplexSession:
                     "text": response_text,
                     "is_final": True,
                     "replace": True,
+                    "model_variant": self._model_variant,
                 },
             )
 

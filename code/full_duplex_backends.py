@@ -10,6 +10,7 @@ import asyncio
 import base64
 import os
 import re
+import threading
 import tempfile
 import wave
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from typing import AsyncIterator, Iterable, List, Optional
 import numpy as np
 from config import (
     DEFAULT_QWEN_MODEL,
+    DEFAULT_QWEN_LORA_DIRS,
     DEFAULT_QWEN_LOCAL_DIRS,
     DEFAULT_REALTIME_QWEN_MODEL,
     DEFAULT_SENSEVOICE_MODEL,
@@ -51,6 +53,37 @@ def _resolve_qwen_model_path(env_var: str = "REALTIME_QWEN_MODEL_PATH") -> str:
             return candidate
 
     return _default_model_path(DEFAULT_QWEN_LOCAL_DIRS[0])
+
+
+def _resolve_qwen_lora_path(env_var: str = "REALTIME_QWEN_LORA_ADAPTER_PATH") -> str:
+    env_path = os.environ.get(env_var) or os.environ.get("QWEN_LORA_ADAPTER_PATH")
+    if env_path and os.path.exists(env_path):
+        return env_path
+
+    for dirname in DEFAULT_QWEN_LORA_DIRS:
+        candidate = _default_model_path(dirname)
+        if os.path.exists(candidate):
+            return candidate
+
+    return _default_model_path(DEFAULT_QWEN_LORA_DIRS[0])
+
+
+def _normalize_model_variant(raw_variant: str) -> str:
+    variant = str(raw_variant or "base").strip().lower()
+    if variant in {"lora", "finetuned", "fine_tuned", "ft", "sft"}:
+        return "lora"
+    return "base"
+
+
+def _configured_model_variant() -> str:
+    raw_variant = (
+        os.environ.get("REALTIME_QWEN_MODEL_VARIANT")
+        or os.environ.get("QWEN_MODEL_VARIANT")
+        or os.environ.get("QWEN_DEFAULT_MODEL_VARIANT")
+        or os.environ.get("BACKEND_MODEL_VARIANT")
+        or "base"
+    )
+    return _normalize_model_variant(raw_variant)
 
 
 def split_sentences(text: str) -> List[str]:
@@ -614,18 +647,60 @@ class QwenRealtimeBackend:
 
     def __init__(self) -> None:
         self.engine = ConversationEngine()
+        self.lora_engine: Optional[ConversationEngine] = None
         self.model_name = os.environ.get("REALTIME_QWEN_MODEL_NAME", DEFAULT_REALTIME_QWEN_MODEL)
         self.local_model_path = _resolve_qwen_model_path("REALTIME_QWEN_MODEL_PATH")
+        self.lora_adapter_path = _resolve_qwen_lora_path("REALTIME_QWEN_LORA_ADAPTER_PATH")
+        self.default_model_variant = _configured_model_variant()
         self.loaded = False
+        self.lora_loaded = False
+        self._lora_lock = threading.Lock()
 
     def load(self) -> None:
+        if self.default_model_variant == "lora":
+            self.load_lora()
+            return
+
+        self.load_base()
+
+    def load_base(self) -> None:
         if self.loaded:
             return
         local_path = self.local_model_path if os.path.exists(self.local_model_path) else None
         model_name = self.model_name if not local_path else None
+        print("[full_duplex] Realtime Qwen model variant: base")
         self.loaded = bool(self.engine.init_model(model_name=model_name, local_model_path=local_path))
         if not self.loaded:
             print(f"[full_duplex] Realtime Qwen init failed, legacy fallback: {DEFAULT_QWEN_MODEL}")
+
+    def load_lora(self) -> None:
+        if self.lora_loaded:
+            return
+        with self._lora_lock:
+            if self.lora_loaded:
+                return
+            local_path = self.local_model_path if os.path.exists(self.local_model_path) else None
+            if not local_path:
+                raise RuntimeError(f"[full_duplex] Base Qwen model path not found: {self.local_model_path}")
+            if not os.path.exists(self.lora_adapter_path):
+                raise RuntimeError(f"[full_duplex] Qwen LoRA adapter path not found: {self.lora_adapter_path}")
+
+            engine = ConversationEngine()
+            print("[full_duplex] Realtime Qwen model variant: lora")
+            print(f"[full_duplex] Loading realtime Qwen LoRA adapter: {self.lora_adapter_path}")
+            if not engine.init_model(local_model_path=local_path, lora_adapter_path=self.lora_adapter_path):
+                raise RuntimeError(f"[full_duplex] Failed to initialize Qwen LoRA adapter: {self.lora_adapter_path}")
+            self.lora_engine = engine
+            self.lora_loaded = True
+
+    def get_engine(self, model_variant: str = "base") -> ConversationEngine:
+        if model_variant == "lora":
+            self.load_lora()
+            if self.lora_engine is None:
+                raise RuntimeError("[full_duplex] Qwen LoRA engine is not available")
+            return self.lora_engine
+        self.load_base()
+        return self.engine
 
     def build_context_prompt(self, history: List[dict], user_text: str) -> str:
         max_history_messages = max(2, REALTIME_MAX_HISTORY_TURNS * 2)
@@ -635,10 +710,10 @@ class QwenRealtimeBackend:
             max_history_messages=max_history_messages,
         )
 
-    async def generate(self, history: List[dict], user_text: str) -> AsyncIterator[str]:
-        self.load()
+    async def generate(self, history: List[dict], user_text: str, model_variant: str = "base") -> AsyncIterator[str]:
+        engine = self.get_engine(model_variant)
         if os.environ.get("REALTIME_LLM_TEXT_STREAM", "false").lower() not in {"1", "true", "yes", "on"}:
-            yield await self.generate_full(history, user_text)
+            yield await self.generate_full(history, user_text, model_variant=model_variant)
             return
 
         context_prompt = self.build_context_prompt(history, user_text)
@@ -647,7 +722,7 @@ class QwenRealtimeBackend:
 
         def worker() -> None:
             try:
-                for chunk in self.engine.generate_response_stream(
+                for chunk in engine.generate_response_stream(
                     context_prompt,
                     use_context=False,
                 ):
@@ -665,12 +740,12 @@ class QwenRealtimeBackend:
                 break
             yield chunk
 
-    async def generate_full(self, history: List[dict], user_text: str) -> str:
+    async def generate_full(self, history: List[dict], user_text: str, model_variant: str = "base") -> str:
         """Generate a complete response before TTS starts."""
-        self.load()
+        engine = self.get_engine(model_variant)
         context_prompt = self.build_context_prompt(history, user_text)
         return await asyncio.to_thread(
-            self.engine.generate_response,
+            engine.generate_response,
             context_prompt,
             2048,
             False,

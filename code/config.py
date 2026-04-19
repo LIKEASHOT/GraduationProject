@@ -18,6 +18,9 @@ DEFAULT_QWEN_LOCAL_DIRS = [
     "Qwen2.5-1.5B-Instruct",
     "Qwen2.5-7B-Instruct",
 ]
+DEFAULT_QWEN_LORA_DIRS = [
+    "qwen3-4b-oralcoach-stage1-lora",
+]
 DEFAULT_SENSEVOICE_MODEL = "iic/SenseVoiceSmall"
 DEFAULT_SILERO_VAD_REPO = "snakers4/silero-vad"
 
