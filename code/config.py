@@ -19,6 +19,8 @@ DEFAULT_QWEN_LOCAL_DIRS = [
     "Qwen2.5-7B-Instruct",
 ]
 DEFAULT_QWEN_LORA_DIRS = [
+    "qwen3-4b-oralcoach-stage1-v3-closing-lora",
+    "qwen3-4b-oralcoach-stage1-v2-6000-lora",
     "qwen3-4b-oralcoach-stage1-lora",
 ]
 DEFAULT_SENSEVOICE_MODEL = "iic/SenseVoiceSmall"

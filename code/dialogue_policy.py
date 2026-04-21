@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from typing import Iterable, List, Mapping
 
 
@@ -103,6 +104,9 @@ class DialoguePolicy:
         r"pretend",
         r"act as",
         r"practice.*(booking|ordering|shopping|airport|hotel|interview|restaurant)",
+        r"(let'?s|lets|i want to|i would like to|i'?d like to).*\bpractice\b",
+        r"\bpractice\b.*\b(english|speaking|conversation|travel|business|daily)\b",
+        r"\btravel english\b",
         r"book.*(flight|hotel|room|ticket)",
         r"order.*(food|meal|drink)",
     )
@@ -162,6 +166,38 @@ class DialoguePolicy:
         r"先不纠错",
         r"\bstop correcting\b",
         r"\bdon'?t correct\b",
+        r"\bdon[\u2019'?]t correct\b",
+        r"\bdo not correct\b",
+        r"\bdon'?t correct me\b",
+        r"\bdon[\u2019'?]t correct me\b",
+        r"\bdo not correct me\b",
+    )
+
+    CLOSING_PATTERNS = (
+        r"\bthat'?s all\b",
+        r"\bthat is all\b",
+        r"\bnothing else\b",
+        r"\bno more\b",
+        r"\bno need\b",
+        r"\ball done\b",
+        r"^\s*(done|finished)\s*[.!?]*\s*$",
+        r"\bi'?m done\b",
+        r"\bi am done\b",
+        r"\bwe'?re done\b",
+        r"\bwe are done\b",
+        r"\balready finished\b",
+        r"\bwe already finished\b",
+        r"\bi think we already finished\b",
+        r"\bfinished ordering\b",
+        r"\balready finished ordering\b",
+        r"\bthat should be all\b",
+        r"\u7ed3\u675f\u4e86",
+        r"\u4e0d\u7528\u4e86",
+        r"\u6ca1\u6709\u4e86",
+        r"\u5c31\u8fd9\u4e9b",
+        r"\u5230\u8fd9\u91cc",
+        r"\u5df2\u7ecf\u5b8c\u6210",
+        r"\u5df2\u7ecf\u7ed3\u675f",
     )
 
     TRANSLATION_REQUEST_PATTERNS = (
@@ -193,10 +229,12 @@ class DialoguePolicy:
             return cls._build_translation_prompt(state, prompt_history, normalized_user_text)
         if mode == "greeting":
             return cls._build_greeting_prompt(state, prompt_history, normalized_user_text)
+        if mode == "closing":
+            return cls._build_closing_prompt(state, prompt_history, normalized_user_text)
         if mode == "correction_setup":
             return cls._build_correction_setup_prompt(state, prompt_history, normalized_user_text)
         if mode == "correction":
-            return cls._build_correction_prompt(state, normalized_user_text)
+            return cls._build_correction_prompt_relaxed(state, normalized_user_text)
         if mode == "explanation":
             return cls._build_explanation_prompt(state, prompt_history, normalized_user_text)
         if mode == "language_switch":
@@ -221,6 +259,16 @@ class DialoguePolicy:
             return "translation"
         if cls._is_greeting(text) and not state.has_roleplay:
             return "greeting"
+        if cls._is_closing_request(text):
+            return "closing"
+        if cls._is_practice_setup_request(text):
+            return "scene_setup"
+        if cls._matches_any(text, cls.STOP_CORRECTION_PATTERNS):
+            if state.has_roleplay:
+                return "roleplay"
+            if re.search(r"[A-Za-z]{2,}", text):
+                return "roleplay"
+            return "general_tutor"
         if cls._is_correction_setup_request(text):
             return "correction_setup"
         if cls._matches_any(text, cls.CORRECTION_PATTERNS):
@@ -252,6 +300,8 @@ class DialoguePolicy:
             return {"max_new_tokens": 160, "temperature": 0.15, "top_p": 0.75, "repetition_penalty": 1.05}
         if mode == "greeting":
             return {"max_new_tokens": 80, "temperature": 0.35, "top_p": 0.80, "repetition_penalty": 1.08}
+        if mode == "closing":
+            return {"max_new_tokens": 90, "temperature": 0.25, "top_p": 0.75, "repetition_penalty": 1.10}
         if mode == "language_switch":
             return {"max_new_tokens": 90, "temperature": 0.20, "top_p": 0.75, "repetition_penalty": 1.08}
         if mode == "correction_setup":
@@ -398,9 +448,26 @@ class DialoguePolicy:
             # do not apply role-play language rules that may reject Chinese output.
             return False
 
+        if mode == "closing":
+            if cls._extract_questions(response):
+                return True
+            if cls._is_bad_generic_assistant(response):
+                return True
+            return False
+
         if state.has_roleplay and cls._is_bad_generic_assistant(response):
             return True
-        if mode == "correction" and not cls._looks_like_correction_response(response):
+        if (
+            mode in {"roleplay", "mixed_practice", "general_tutor"}
+            and state.last_assistant_text
+            and not cls._is_repeat_request(latest_user_text)
+            and cls._repeats_recent_statement(response, [state.last_assistant_text])
+        ):
+            return True
+        if mode == "correction" and not cls._looks_like_relaxed_correction_response(
+            response,
+            state.last_user_english or cls._extract_target_from_prompt(prompt_or_text),
+        ):
             return True
         if mode == "language_switch":
             if cls._is_language_switch_to_chinese(latest_user_text) and not cls._contains_chinese(response):
@@ -436,6 +503,9 @@ class DialoguePolicy:
                     "\u6211\u4f1a\u76f4\u63a5\u7ed9\u51fa\u8bd1\u6587\u3002"
                 )
             return "\u8bf7\u628a\u4f60\u60f3\u7ffb\u8bd1\u7684\u53e5\u5b50\u53d1\u7ed9\u6211\uff0c\u6216\u8005\u8bf4\u201c\u7ffb\u8bd1\u4e0a\u4e00\u53e5\u201d\u3002"
+
+        if mode == "closing":
+            return "You're right. We can stop here. Nice job finishing this practice."
 
         if mode == "correction_setup":
             return "Sure. Start your introduction, and I'll correct any mistakes as you go."
@@ -473,7 +543,8 @@ class DialoguePolicy:
             prompt = prompt[: -len(f"{assistant_marker}\n")].rstrip()
         history = DialoguePolicy.extract_prompt_history(prompt)
         latest_user_text = DialoguePolicy.extract_latest_user_text(prompt)
-        if DialoguePolicy.classify_user_intent(latest_user_text, history) == "translation":
+        mode = DialoguePolicy.classify_user_intent(latest_user_text, history)
+        if mode == "translation":
             instruction = (
                 "The previous draft handled a translation request incorrectly. "
                 "Use the recent chat history to resolve references such as 'this sentence', 'the previous sentence', "
@@ -482,7 +553,23 @@ class DialoguePolicy:
                 "If the referenced text is Chinese, translate it into natural English. "
                 "Output only the translation, with no labels."
             )
-        elif DialoguePolicy.classify_user_intent(latest_user_text, history) == "language_switch":
+        elif mode == "closing":
+            instruction = (
+                "The previous draft was rejected. The user is closing or completing the current task. "
+                "Do not ask a new question. Do not start a new scenario. "
+                "Briefly confirm completion and close the practice naturally. "
+                "Use plain text only. Output only the final assistant reply."
+            )
+        elif mode == "correction":
+            instruction = (
+                "The previous draft was rejected. The user wants a correction, not a new scenario. "
+                "Provide a natural correction reply for the target English sentence. "
+                "Include a corrected English version and, if helpful, a brief Chinese explanation. "
+                "Do not require a rigid format. Do not ask the user to resend the sentence. "
+                "Do not continue role-play and do not translate unless explicitly asked. "
+                "Output only the final assistant reply."
+            )
+        elif mode == "language_switch":
             if DialoguePolicy._is_language_switch_to_chinese(latest_user_text):
                 instruction = (
                     "The previous draft ignored the requested language. "
@@ -493,7 +580,7 @@ class DialoguePolicy:
                     "The previous draft ignored the requested language. "
                     "Now answer naturally in English. Output only the assistant reply."
                 )
-        elif DialoguePolicy.classify_user_intent(latest_user_text, history) == "explanation":
+        elif mode == "explanation":
             instruction = (
                 "The previous draft was rejected. Answer the user's English-usage question in Chinese only. "
                 "Do not reveal or quote private context. Do not output labels such as State, mode, roleplay, setup, "
@@ -574,6 +661,35 @@ class DialoguePolicy:
         return "\n".join(parts)
 
     @classmethod
+    def _build_closing_prompt(
+        cls,
+        state: TeachingSessionState,
+        history: List[dict],
+        user_text: str,
+    ) -> str:
+        system_prompt = (
+            "You are an English speaking coach for Chinese learners.\n"
+            f"{cls._state_card(state, 'closing')}\n"
+            "Task: the user is closing or completing the current practice/task.\n"
+            "Confirm completion naturally and stop the current flow.\n"
+            "Do not ask a new question unless the user explicitly asks to continue.\n"
+            "Do not start another scenario or introduce a new topic.\n"
+            "Do not repeat the user's answer or the previous assistant reply.\n"
+            "If role-play is active, close that scenario politely in character if appropriate.\n"
+            "Use plain text only: no Markdown, no bold markers, no bullet lists, no headings.\n"
+            "Output only the assistant reply.\n"
+        )
+        parts: List[str] = [f"<|im_start|>system\n{system_prompt}<|im_end|>"]
+        for message in history[-8:]:
+            role = message.get("role", "user")
+            content = message.get("content", "").strip()
+            if content:
+                parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
+        parts.append(f"<|im_start|>user\n{user_text}<|im_end|>")
+        parts.append("<|im_start|>assistant\n")
+        return "\n".join(parts)
+
+    @classmethod
     def _build_correction_setup_prompt(
         cls,
         state: TeachingSessionState,
@@ -615,6 +731,26 @@ class DialoguePolicy:
             "更自然的说法：<corrected English>\n"
             "说明：<brief Chinese explanation of the key issue>\n"
             "Do not continue role-play. Do not ask for the sentence if TARGET is provided.\n"
+            f"TARGET: {target_line}\n"
+            "<|im_end|>\n"
+            f"<|im_start|>user\n{user_text}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+
+    @classmethod
+    def _build_correction_prompt_relaxed(cls, state: TeachingSessionState, user_text: str) -> str:
+        target = state.last_user_english
+        target_line = target or "(no English sentence found)"
+        return (
+            "<|im_start|>system\n"
+            "You are an English grammar correction tutor for Chinese learners.\n"
+            "Task: correct the target English sentence only.\n"
+            "Use plain text only: no Markdown, no bold markers, no bullet lists, no headings.\n"
+            "Prefer a natural correction reply instead of a rigid template.\n"
+            "A good reply should include a corrected English version and, if helpful, a brief Chinese explanation.\n"
+            "You may use formats like 'More natural: ...' or '更自然可以说：...' but exact labels are not required.\n"
+            "Do not continue role-play. Do not ask the user to resend the sentence if TARGET is provided.\n"
+            "Do not translate unless the user explicitly asked for translation.\n"
             f"TARGET: {target_line}\n"
             "<|im_end|>\n"
             f"<|im_start|>user\n{user_text}<|im_end|>\n"
@@ -711,6 +847,9 @@ class DialoguePolicy:
             "- Never repeat your previous assistant reply. If the user repeats or slightly changes the same sentence, respond to it directly instead of restarting the scenario.\n"
             "- If the user asked not to repeat their answers, never start with 'You said', 'Great, you said', or a full restatement.\n"
             "- Do not ask the same question or same topic that appears in recent_ai_questions.\n"
+            "- Do not ask a question every turn. Ask only when the current task genuinely needs one.\n"
+            "- If the user says the task is finished, complete, or that's all, close the scenario instead of starting a new topic.\n"
+            "- When the user gives a final answer such as 'No, that's all', confirm completion and stop.\n"
             "- If the user says you are the teacher, you should ask the next practice question instead of asking the user to ask you.\n"
             "- If the user says a topic is already discussed, move to a new angle or follow-up topic.\n"
             "- If the user asks to translate 'this sentence', 'that sentence', or 'what you just said', translate the referenced assistant text from the recent context; do not translate the user's command itself.\n"
@@ -954,9 +1093,11 @@ class DialoguePolicy:
             cls._matches_any(stripped, cls.SCENE_SETUP_PATTERNS)
             or cls._is_language_switch_to_english(stripped)
             or cls._is_language_switch_to_chinese(stripped)
+            or cls._is_practice_setup_request(stripped)
             or cls._matches_any(stripped, cls.NO_REPEAT_PATTERNS)
             or cls._matches_any(stripped, cls.TEACHER_ASK_PATTERNS)
             or cls._matches_any(stripped, cls.STOP_CORRECTION_PATTERNS)
+            or cls._is_closing_request(stripped)
             or cls._is_correction_setup_request(stripped)
             or cls._matches_any(stripped, cls.TRANSLATION_REQUEST_PATTERNS)
             or lowered in {"in english", "speak english", "in chinese", "speak chinese"}
@@ -975,6 +1116,27 @@ class DialoguePolicy:
             and re.search(r"\b(if|when|while|during|as i|after i)\b", lowered)
             and not re.search(r"\b(this sentence|this phrase|the sentence|the phrase)\b", lowered)
         )
+
+    @classmethod
+    def _is_practice_setup_request(cls, text: str) -> bool:
+        stripped = (text or "").strip()
+        if not stripped:
+            return False
+        lowered = stripped.lower()
+        if cls._matches_any(stripped, cls.SCENE_SETUP_PATTERNS):
+            return True
+        return (
+            re.search(r"\b(let'?s|lets|want to|would like to|like to)\b.*\bpractice\b", lowered)
+            or re.search(r"\bpractice\b.*\b(english|speaking|conversation|travel|business|daily)\b", lowered)
+            or "you ask me" in lowered
+        )
+
+    @classmethod
+    def _is_closing_request(cls, text: str) -> bool:
+        stripped = (text or "").strip()
+        if not stripped:
+            return False
+        return cls._matches_any(stripped, cls.CLOSING_PATTERNS)
 
     @classmethod
     def _is_greeting(cls, text: str) -> bool:
@@ -1043,6 +1205,66 @@ class DialoguePolicy:
         return "更自然" in (text or "") and "说明" in (text or "")
 
     @classmethod
+    def _looks_like_relaxed_correction_response(cls, text: str, target_text: str = "") -> bool:
+        raw = (text or "").strip()
+        if not raw:
+            return False
+
+        normalized = re.sub(r"\s+", " ", raw).strip().lower()
+        if any(
+            phrase in normalized
+            for phrase in (
+                "please send it again",
+                "please send it once more",
+                "please send the sentence",
+                "please provide the sentence",
+            )
+        ):
+            return False
+        if any(
+            phrase in raw
+            for phrase in (
+                "请再发一次",
+                "请把你想纠正",
+                "请把句子发给我",
+            )
+        ):
+            return False
+
+        has_english = bool(re.search(r"[A-Za-z]{2,}", raw))
+        if not has_english:
+            return False
+
+        if "更自然" in raw or "语法" in raw or "说明" in raw:
+            return True
+        if any(
+            cue in normalized
+            for cue in (
+                "more natural",
+                "better version",
+                "better way",
+                "you can say",
+                "a natural way",
+                "correct version",
+                "i'd say",
+                "try saying",
+            )
+        ):
+            return True
+
+        target_norm = cls._normalize_statement(target_text)
+        response_norm = cls._normalize_statement(raw)
+        if target_norm and response_norm:
+            if response_norm == target_norm:
+                return False
+            similarity = SequenceMatcher(None, response_norm, target_norm).ratio()
+            if similarity >= 0.95:
+                return False
+            return True
+
+        return True
+
+    @classmethod
     def _fallback_roleplay_response(cls, state: TeachingSessionState, latest_user_text: str) -> str:
         text = (latest_user_text or "").strip()
         lowered = text.lower()
@@ -1095,6 +1317,7 @@ class DialoguePolicy:
             cls._matches_any(stripped, cls.NO_REPEAT_PATTERNS)
             or cls._matches_any(stripped, cls.TEACHER_ASK_PATTERNS)
             or cls._matches_any(stripped, cls.STOP_CORRECTION_PATTERNS)
+            or cls._is_closing_request(stripped)
             or cls._is_language_switch_to_chinese(stripped)
             or cls._is_translation_request(stripped)
             or cls._matches_any(stripped, cls.EXPLANATION_PATTERNS)
@@ -1128,6 +1351,36 @@ class DialoguePolicy:
         )
         return any(re.search(pattern, normalized) for pattern in patterns)
 
+    @staticmethod
+    def _is_repeat_request(text: str) -> bool:
+        normalized = re.sub(r"\s+", " ", text or "").strip().lower()
+        patterns = (
+            r"\brepeat\b",
+            r"\bsay (it|that) again\b",
+            r"\bone more time\b",
+            r"\bagain please\b",
+            r"\u518d\u8bf4\u4e00\u904d",
+            r"\u91cd\u590d\u4e00\u4e0b",
+            r"\u518d\u6765\u4e00\u904d",
+        )
+        return any(re.search(pattern, normalized) for pattern in patterns)
+
+    @classmethod
+    def _repeats_recent_statement(cls, response: str, recent_texts: List[str]) -> bool:
+        response_norm = cls._normalize_statement(response)
+        if not response_norm:
+            return False
+        for recent_text in recent_texts:
+            recent_norm = cls._normalize_statement(recent_text)
+            if not recent_norm:
+                continue
+            if response_norm == recent_norm:
+                return True
+            similarity = SequenceMatcher(None, response_norm, recent_norm).ratio()
+            if similarity >= 0.92:
+                return True
+        return False
+
     @classmethod
     def _repeats_recent_question(cls, response: str, recent_questions: List[str]) -> bool:
         response_questions = cls._extract_questions(response)
@@ -1147,6 +1400,11 @@ class DialoguePolicy:
     @staticmethod
     def _normalize_question(question: str) -> str:
         normalized = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", (question or "").lower())
+        return re.sub(r"\s+", " ", normalized).strip()
+
+    @staticmethod
+    def _normalize_statement(text: str) -> str:
+        normalized = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", (text or "").lower())
         return re.sub(r"\s+", " ", normalized).strip()
 
     @staticmethod
