@@ -194,6 +194,7 @@ class ConversationEngine:
                 top_p=top_p,
                 repetition_penalty=repetition_penalty,
             )
+            response = DialoguePolicy.finalize_response(prompt, response)
             response = self._repair_response_with_policy(
                 prompt,
                 response,
@@ -291,13 +292,15 @@ class ConversationEngine:
                 top_p=retry_top_p,
                 repetition_penalty=max(repetition_penalty, 1.12),
             )
+            response = DialoguePolicy.finalize_response(prompt, response)
 
         if DialoguePolicy.response_needs_retry(prompt, response):
             print(
                 "Generated response rejected after "
                 f"{max_retries} retries, using dialogue fallback."
             )
-            return DialoguePolicy.fallback_response(prompt)
+            fallback = DialoguePolicy.fallback_response(prompt)
+            return DialoguePolicy.finalize_response(prompt, fallback)
         return response
 
     @staticmethod

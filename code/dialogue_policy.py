@@ -183,6 +183,8 @@ class DialoguePolicy:
         r"^\s*(done|finished)\s*[.!?]*\s*$",
         r"\bi'?m done\b",
         r"\bi am done\b",
+        r"\bi'?m finished\b",
+        r"\bi am finished\b",
         r"\bwe'?re done\b",
         r"\bwe are done\b",
         r"\balready finished\b",
@@ -191,13 +193,103 @@ class DialoguePolicy:
         r"\bfinished ordering\b",
         r"\balready finished ordering\b",
         r"\bthat should be all\b",
+        r"\bthat'?s enough\b",
+        r"\bthat is enough\b",
+        r"\bi think that'?s enough\b",
+        r"\bi'?m done for now\b",
+        r"\bi want to stop\b",
+        r"\bstop here\b",
+        r"\bstop here please\b",
+        r"\bcan we finish here\b",
+        r"\bwe can end\b",
+        r"\bend this practice\b",
+        r"\bend the role[- ]?play\b",
+        r"\bfinish this conversation\b",
+        r"\bi need to go\b",
+        r"\bno more questions\b",
+        r"\bno need to ask more\b",
+        r"\bdon'?t want to continue\b",
+        r"\bi don'?t want to continue\b",
+        r"\bthank you[, ]+bye\b",
+        r"\bthanks[, ]+see you next time\b",
+        r"\bsee you next time\b",
         r"\u7ed3\u675f\u4e86",
+        r"\u7ed3\u675f\u5427",
         r"\u4e0d\u7528\u4e86",
+        r"\u4e0d\u7528\u7ee7\u7eed",
+        r"\u4e0d\u7528\u518d\u7ee7\u7eed",
+        r"\u4e0d\u7528\u7ee7\u7eed\u95ee",
+        r"\u4e0d\u60f3\u7ee7\u7eed",
         r"\u6ca1\u6709\u4e86",
         r"\u5c31\u8fd9\u4e9b",
         r"\u5230\u8fd9\u91cc",
+        r"\u5230\u8fd9\u513f",
+        r"\u5c31\u5230\u8fd9",
         r"\u5df2\u7ecf\u5b8c\u6210",
         r"\u5df2\u7ecf\u7ed3\u675f",
+        r"\u4eca\u5929\u7684\u7ec3\u4e60\u7ed3\u675f",
+        r"\u4eca\u5929.*\u7ec3\u5230",
+        r"\u4eca\u5929.*\u4e0d\u804a",
+        r"\u4eca\u5929.*\u591f\u4e86",
+        r"\u7ec3\u5f97.*\u5dee\u4e0d\u591a",
+        r"\u5148\u4e0d\u7ec3",
+        r"\u5148\u4e0d\u804a",
+        r"\u5148\u5230\u8fd9",
+        r"\u5148\u53bb\u5fd9",
+        r"\u5148\u4e0b\u4e86",
+        r"\u6211\u60f3\u7ed3\u675f",
+        r"\u53ef\u4ee5\u7ed3\u675f",
+        r"\u53ef\u4ee5\u4e86",
+        r"\u8fd9\u8f6e\u7ed3\u675f",
+        r"\u8fd9\u4e2a\u7ec3\u4e60\u5148\u7ed3\u675f",
+        r"\u8fd9\u6bb5\u5bf9\u8bdd\u7ed3\u675f",
+        r"\u660e\u5929\u518d\u7ee7\u7eed",
+        r"\u62dc\u62dc",
+    )
+
+    CLOSING_CONTINUATION_PATTERNS = (
+        r"\bwould you like\b",
+        r"\bdo you want\b",
+        r"\bwant to\b",
+        r"\blet'?s move on\b",
+        r"\bmove on\b",
+        r"\btry (this|another|something)\b",
+        r"\bpractice (another|something|more)\b",
+        r"\bcontinue\b",
+        r"\banother (sentence|topic|scene|time)\b",
+        r"\bnext (topic|question|step|scene)\b",
+        r"\bmore help\b",
+        r"\bagain later\b",
+        r"\bwhat would you say\b",
+        r"\bwhat would you like\b",
+        r"\bhow would you like\b",
+        r"\bproceed\b",
+        r"\bdestination\b",
+        r"\bcheck in again\b",
+        r"\bgreat job\b",
+        r"\bnice work\b",
+        r"\bnice effort\b",
+        r"\bperfect\b",
+        r"\bwell done\b",
+        r"\byou did well\b",
+        r"\byou'?re ready\b",
+        r"\bwe'?ve covered\b",
+        r"\ball (the )?(key points|basics)\b",
+        r"\bwe finished\b",
+        r"\bwe'?re done here\b",
+        r"\bmeal is confirmed\b",
+        r"\bfinished talking about\b",
+        r"\byou ordered\b",
+        r"\bis complete\b",
+        r"\bhere is complete\b",
+        r"\bairport check-in complete\b",
+        r"\byour meal will be ready\b",
+        r"\u518d\u7ec3",
+        r"\u6362\u4e2a",
+        r"\u4e0b\u4e00\u4e2a",
+        r"\u8981\u4e0d\u8981",
+        r"\u60f3\u4e0d\u60f3",
+        r"\u8981\u7ee7\u7eed",
     )
 
     TRANSLATION_REQUEST_PATTERNS = (
@@ -215,31 +307,17 @@ class DialoguePolicy:
         max_history_messages: int | None = None,
     ) -> str:
         normalized_user_text = (user_text or "").strip()
+        raw_history = list(history or [])
         prompt_history = cls._without_duplicate_latest_user(
-            cls._normalized_history(history or []),
+            cls._normalized_history(raw_history),
             normalized_user_text,
         )
         max_messages = max_history_messages or cls.MAX_DEFAULT_HISTORY_MESSAGES
         prompt_history = prompt_history[-max(2, max_messages) :]
 
-        state = cls.extract_state(prompt_history, normalized_user_text)
-        mode = cls.classify_user_intent(normalized_user_text, prompt_history)
-
-        if mode == "translation":
-            return cls._build_translation_prompt(state, prompt_history, normalized_user_text)
-        if mode == "greeting":
-            return cls._build_greeting_prompt(state, prompt_history, normalized_user_text)
-        if mode == "closing":
-            return cls._build_closing_prompt(state, prompt_history, normalized_user_text)
-        if mode == "correction_setup":
-            return cls._build_correction_setup_prompt(state, prompt_history, normalized_user_text)
-        if mode == "correction":
-            return cls._build_correction_prompt_relaxed(state, normalized_user_text)
-        if mode == "explanation":
-            return cls._build_explanation_prompt(state, prompt_history, normalized_user_text)
-        if mode == "language_switch":
-            return cls._build_language_switch_prompt(state, prompt_history, normalized_user_text)
-        return cls._build_roleplay_prompt(state, prompt_history, normalized_user_text, mode)
+        state = cls.extract_state(raw_history or prompt_history, normalized_user_text)
+        focus = cls.classify_user_intent(normalized_user_text, prompt_history)
+        return cls._build_unified_prompt(state, prompt_history, normalized_user_text, focus)
 
     @classmethod
     def ensure_system_prompt(cls, prompt_or_text: str) -> str:
@@ -252,67 +330,24 @@ class DialoguePolicy:
     @classmethod
     def classify_user_intent(cls, user_text: str, history: Iterable[Mapping[str, str]] | None = None) -> str:
         text = (user_text or "").strip()
-        normalized_history = cls._normalized_history(history or [])
-        state = cls.extract_state(normalized_history, text)
-
-        if cls._is_translation_request(text, normalized_history):
-            return "translation"
-        if cls._is_greeting(text) and not state.has_roleplay:
-            return "greeting"
         if cls._is_closing_request(text):
             return "closing"
-        if cls._is_practice_setup_request(text):
-            return "scene_setup"
-        if cls._matches_any(text, cls.STOP_CORRECTION_PATTERNS):
-            if state.has_roleplay:
-                return "roleplay"
-            if re.search(r"[A-Za-z]{2,}", text):
-                return "roleplay"
-            return "general_tutor"
-        if cls._is_correction_setup_request(text):
-            return "correction_setup"
-        if cls._matches_any(text, cls.CORRECTION_PATTERNS):
+        if cls._is_explicit_translation_request_v2(text):
+            return "translation"
+        if cls._is_explicit_correction_request_v2(text):
             return "correction"
-        if cls._matches_any(text, cls.EXPLANATION_PATTERNS):
-            return "explanation"
-        if cls._matches_any(text, cls.SCENE_SETUP_PATTERNS):
-            return "scene_setup"
-        if (
-            not cls._is_translation_request(text)
-            and (cls._is_language_switch_to_english(text) or cls._is_language_switch_to_chinese(text))
-        ):
-            return "language_switch"
-        if state.has_roleplay:
-            return "roleplay"
-
-        has_ascii_words = bool(re.search(r"[A-Za-z]{2,}", text))
-        has_cjk = bool(re.search(r"[\u4e00-\u9fff]", text))
-        if has_ascii_words and not has_cjk:
-            return "roleplay"
-        if has_ascii_words and has_cjk:
-            return "mixed_practice"
-        return "general_tutor"
+        return "general"
 
     @classmethod
     def generation_config(cls, user_text: str, history: Iterable[Mapping[str, str]] | None = None) -> dict:
         mode = cls.classify_user_intent(user_text, history or [])
         if mode == "translation":
-            return {"max_new_tokens": 160, "temperature": 0.15, "top_p": 0.75, "repetition_penalty": 1.05}
-        if mode == "greeting":
-            return {"max_new_tokens": 80, "temperature": 0.35, "top_p": 0.80, "repetition_penalty": 1.08}
-        if mode == "closing":
-            return {"max_new_tokens": 90, "temperature": 0.25, "top_p": 0.75, "repetition_penalty": 1.10}
-        if mode == "language_switch":
-            return {"max_new_tokens": 90, "temperature": 0.20, "top_p": 0.75, "repetition_penalty": 1.08}
-        if mode == "correction_setup":
-            return {"max_new_tokens": 90, "temperature": 0.30, "top_p": 0.80, "repetition_penalty": 1.08}
-        if mode == "roleplay":
-            return {"max_new_tokens": 140, "temperature": 0.40, "top_p": 0.80, "repetition_penalty": 1.12}
+            return {"max_new_tokens": 180, "temperature": 0.25, "top_p": 0.80, "repetition_penalty": 1.08}
         if mode == "correction":
-            return {"max_new_tokens": 220, "temperature": 0.20, "top_p": 0.75, "repetition_penalty": 1.08}
-        if mode in {"explanation", "mixed_practice"}:
-            return {"max_new_tokens": 280, "temperature": 0.35, "top_p": 0.82, "repetition_penalty": 1.10}
-        return {"max_new_tokens": 220, "temperature": 0.40, "top_p": 0.85, "repetition_penalty": 1.12}
+            return {"max_new_tokens": 220, "temperature": 0.30, "top_p": 0.82, "repetition_penalty": 1.08}
+        if mode == "closing":
+            return {"max_new_tokens": 120, "temperature": 0.25, "top_p": 0.80, "repetition_penalty": 1.10}
+        return {"max_new_tokens": 220, "temperature": 0.45, "top_p": 0.90, "repetition_penalty": 1.08}
 
     @classmethod
     def build_context_card(
@@ -322,7 +357,254 @@ class DialoguePolicy:
         mode: str,
     ) -> str:
         state = cls.extract_state(cls._normalized_history(history or []), user_text)
-        return cls._state_card(state, mode)
+        return cls._simplified_context_card(state, mode)
+
+    @classmethod
+    def _build_unified_prompt(
+        cls,
+        state: TeachingSessionState,
+        history: List[dict],
+        user_text: str,
+        focus: str,
+    ) -> str:
+        translation_target = cls._infer_explicit_translation_target(history, user_text)
+        correction_target = state.last_user_english
+        strategy_hints = cls._strategy_hints(
+            state,
+            history,
+            user_text,
+            focus,
+            translation_target,
+        )
+
+        system_prompt = (
+            "You are a patient English speaking coach for Chinese learners.\n"
+            "Use the conversation naturally instead of following rigid mode templates.\n"
+            "Understand the user's real intention from the latest turn and recent context.\n"
+            f"Current focus: {focus}\n"
+            f"{cls._simplified_context_card(state, focus)}\n"
+            f"{strategy_hints}"
+            "Core rules:\n"
+            "- Preserve the ongoing scene or topic when it still matters, but do not force role-play if the user changes task.\n"
+            "- If the user asks to correct a sentence, give a natural correction. A rigid output format is not required.\n"
+            "- If the user asks to translate 'this sentence', 'that sentence', or 'what you just said', translate the referenced recent text instead of translating the command itself.\n"
+            "- If the user asks for explanation, explain briefly and clearly.\n"
+            "- If the user asks to switch language, follow that request naturally.\n"
+            "- Do not mechanically repeat your previous assistant reply unless the user explicitly asks you to repeat it.\n"
+            "- Ask at most one useful next question when a question is actually needed. If no question is needed, do not force one.\n"
+            "- Use plain text only: no Markdown, no headings, no bullet lists.\n"
+            "- Output only the assistant reply.\n"
+        )
+        if translation_target:
+            system_prompt += (
+                "Translation requirement: translate the full target sentence faithfully and completely.\n"
+                "Do not answer the topic. Do not paraphrase. Do not add or remove meaning.\n"
+                "If the target is English, translate it into natural Chinese. "
+                "If the target is Chinese, translate it into natural English.\n"
+                f"Referenced translation target: {translation_target}\n"
+            )
+        if focus == "correction" and correction_target:
+            system_prompt += f"Correction target: {correction_target}\n"
+        if focus == "closing":
+            system_prompt += (
+                "Closing requirement: the user is ending or completing the current practice/task.\n"
+                "Reply with one short natural closing sentence.\n"
+                "Briefly acknowledge completion and stop naturally.\n"
+                "Match the user's language when it is obvious.\n"
+                "Do not ask any question. Do not start a new scenario. Do not invite a new topic.\n"
+                "Do not suggest continuing, moving on, trying another sentence, or practicing something else.\n"
+                "Avoid adding unconfirmed scene details or unnecessary praise.\n"
+            )
+
+        parts: List[str] = [f"<|im_start|>system\n{system_prompt}<|im_end|>"]
+        for message in history:
+            role = message.get("role", "user")
+            content = message.get("content", "").strip()
+            if content:
+                parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
+        parts.append(f"<|im_start|>user\n{user_text}<|im_end|>")
+        parts.append("<|im_start|>assistant\n")
+        return "\n".join(parts)
+
+    @classmethod
+    def _simplified_context_card(cls, state: TeachingSessionState, focus: str) -> str:
+        lines = ["Conversation context:"]
+        lines.append(f"- focus: {focus}")
+        if state.scenario_setup:
+            lines.append(f"- scenario_setup: {state.scenario_setup}")
+        if state.practice_language:
+            lines.append(f"- preferred_language: {state.practice_language}")
+        if state.last_user_english:
+            lines.append(f"- last_user_english: {state.last_user_english}")
+        if state.last_assistant_text:
+            lines.append(f"- last_assistant_text: {state.last_assistant_text}")
+        if state.recent_ai_questions:
+            lines.append("- recent_ai_questions:")
+            for question in state.recent_ai_questions[-3:]:
+                lines.append(f"  * {question}")
+        if state.user_facts:
+            lines.append("- user_facts:")
+            for fact in state.user_facts[-4:]:
+                lines.append(f"  * {fact}")
+        return "\n".join(lines)
+
+    @classmethod
+    def _strategy_hints(
+        cls,
+        state: TeachingSessionState,
+        history: Iterable[Mapping[str, str]],
+        user_text: str,
+        focus: str,
+        translation_target: str = "",
+    ) -> str:
+        hints: List[str] = []
+
+        if state.has_roleplay:
+            hints.append(
+                "Scene continuity: treat scenario_setup, user_facts, last_assistant_text, "
+                "and recent_ai_questions as the current state. Do not restart completed steps, "
+                "do not invent a completed order/check-in, and do not ask the same topic again."
+            )
+
+        if cls._is_short_contextual_user_turn(user_text, history):
+            hints.append(
+                "ASR/context recovery: the latest user text is likely a short spoken answer "
+                "to the previous assistant question. Infer it from last_assistant_text, "
+                "do not explain the words themselves, and continue the same task with one "
+                "focused next step or one focused clarification."
+            )
+
+        if state.correction_mode == "gentle" and focus == "general":
+            hints.append(
+                "Correction preference: if the latest English sentence has a clear mistake, "
+                "briefly give a more natural version before continuing. If it is acceptable, "
+                "continue normally without forcing a correction."
+            )
+
+        if cls._is_explanation_like_request_v2(user_text):
+            hints.append(
+                "Explanation: answer the meaning or usage question directly. Prefer Chinese "
+                "when the user asks in Chinese or mixes Chinese. Give one short example when useful. "
+                "Do not force a new practice question after the explanation."
+            )
+
+        if translation_target:
+            hints.append(
+                "Translation: output the translation or meaning of the referenced target only. "
+                "Do not answer the target topic and do not add a follow-up practice question."
+            )
+
+        if state.teacher_should_ask:
+            hints.append(
+                "Teacher-led practice: lead with one specific next question tied to the current "
+                "topic or scene, not an open 'what do you want to do next' question."
+            )
+
+        if not hints:
+            return ""
+        return "Strategy hints:\n" + "".join(f"- {hint}\n" for hint in hints)
+
+    @classmethod
+    def _is_explicit_translation_request(cls, text: str) -> bool:
+        lowered = (text or "").strip().lower()
+        if not lowered:
+            return False
+        return (
+            "翻译" in (text or "")
+            or "译一下" in (text or "")
+            or bool(re.search(r"\btranslate\b", lowered))
+            or bool(re.search(r"\btranslation\b", lowered))
+        )
+
+    @classmethod
+    def _is_explicit_correction_request(cls, text: str) -> bool:
+        raw = (text or "").strip()
+        lowered = raw.lower()
+        if not raw:
+            return False
+        if any(
+            phrase in raw
+            for phrase in (
+                "语法错误",
+                "有语法错误吗",
+                "纠正",
+                "改一下",
+                "更自然",
+                "帮我改",
+                "帮我纠错",
+            )
+        ):
+            return True
+        return bool(
+            re.search(
+                r"\b(correct|fix|grammar|grammatical|natural|better version|better way|is this wrong)\b",
+                lowered,
+            )
+        )
+
+    @classmethod
+    def _infer_explicit_translation_target(cls, history: Iterable[Mapping[str, str]], user_text: str) -> str:
+        if not cls._is_explicit_translation_request_v2(user_text):
+            return ""
+        direct_target = cls._extract_direct_translation_text(user_text)
+        if direct_target:
+            return cls._compact(direct_target, 500)
+
+        for message in reversed(cls._normalized_history(history or [])):
+            if message.get("role") == "assistant":
+                return cls._compact(message.get("content", "").strip(), 500)
+        return ""
+
+    @classmethod
+    def _is_explicit_translation_request_v2(cls, text: str) -> bool:
+        raw = text or ""
+        lowered = raw.strip().lower()
+        if not lowered:
+            return False
+        return (
+            "\u7ffb\u8bd1" in raw
+            or "\u8bd1\u4e00\u4e0b" in raw
+            or "\u7528\u4e2d\u6587\u7ffb\u8bd1" in raw
+            or "\u7528\u82f1\u6587\u7ffb\u8bd1" in raw
+            or "\u82f1\u6587\u600e\u4e48\u8bf4" in raw
+            or "\u7528\u82f1\u6587\u600e\u4e48\u8bf4" in raw
+            or "\u4e2d\u6587\u600e\u4e48\u8bf4" in raw
+            or "\u7528\u4e2d\u6587\u600e\u4e48\u8bf4" in raw
+            or "\u82f1\u6587\u662f\u4ec0\u4e48" in raw
+            or "\u4e2d\u6587\u662f\u4ec0\u4e48" in raw
+            or bool(re.search(r"(\u8fd9\u53e5\u8bdd|\u8fd9\u53e5|\u521a\u624d\u90a3\u53e5|\u521a\u521a\u90a3\u53e5).*(\u4ec0\u4e48\u610f\u601d|\u610f\u601d)", raw))
+            or bool(re.search(r"\btranslate\b", lowered))
+            or bool(re.search(r"\btranslation\b", lowered))
+            or bool(re.search(r"\bhow (do|should|can|to) (i )?say\b", lowered))
+            or bool(re.search(r"\bwhat (does|is) .{1,80} (mean )?in chinese\b", lowered))
+            or bool(re.search(r"\bwhat (does|is) .{1,80} (mean )?in english\b", lowered))
+        )
+
+    @classmethod
+    def _is_explicit_correction_request_v2(cls, text: str) -> bool:
+        raw = (text or "").strip()
+        lowered = raw.lower()
+        if not raw:
+            return False
+        if any(
+            phrase in raw
+            for phrase in (
+                "\u8bed\u6cd5\u9519\u8bef",
+                "\u6709\u8bed\u6cd5\u9519\u8bef\u5417",
+                "\u7ea0\u6b63",
+                "\u6539\u4e00\u4e0b",
+                "\u66f4\u81ea\u7136",
+                "\u5e2e\u6211\u6539",
+                "\u5e2e\u6211\u7ea0\u9519",
+            )
+        ):
+            return True
+        return bool(
+            re.search(
+                r"\b(correct|fix|grammar|grammatical|natural|better version|better way|is this wrong)\b",
+                lowered,
+            )
+        )
 
     @classmethod
     def extract_state(
@@ -330,8 +612,12 @@ class DialoguePolicy:
         history: Iterable[Mapping[str, str]],
         latest_user_text: str = "",
     ) -> TeachingSessionState:
-        normalized = cls._normalized_history(history)
         state = TeachingSessionState()
+        for message in history or []:
+            if str(message.get("role", "")).strip().lower() == "system":
+                cls._apply_system_context_to_state(state, str(message.get("content", "")))
+
+        normalized = cls._normalized_history(history)
 
         for message in normalized:
             if message.get("role") == "assistant":
@@ -389,6 +675,20 @@ class DialoguePolicy:
         state.recent_ai_questions = cls._dedupe_keep_order(state.recent_ai_questions)[-5:]
         return state
 
+    @classmethod
+    def _apply_system_context_to_state(cls, state: TeachingSessionState, content: str) -> None:
+        text = content or ""
+        scene_match = re.search(r"(?im)^\s*-\s*scene\s*:\s*(.+)$", text)
+        if scene_match and not state.scenario_setup:
+            state.scenario_setup = cls._compact(f"scene: {scene_match.group(1).strip()}", 220)
+
+        language_match = re.search(r"(?im)^\s*-\s*practice_language\s*:\s*(.+)$", text)
+        if language_match and not state.practice_language:
+            state.practice_language = cls._compact(language_match.group(1).strip(), 40)
+
+        if re.search(r"\bcorrect\b|\bcorrection\b", text, flags=re.IGNORECASE) and not state.correction_mode:
+            state.correction_mode = "gentle"
+
     @staticmethod
     def extract_latest_user_text(prompt_or_text: str) -> str:
         text = prompt_or_text or ""
@@ -421,9 +721,35 @@ class DialoguePolicy:
 
     @classmethod
     def direct_response(cls, prompt_or_text: str) -> str:
+        history = cls.extract_prompt_history(prompt_or_text)
+        latest_user_text = cls.extract_latest_user_text(prompt_or_text)
+        if cls.classify_user_intent(latest_user_text, history) == "closing":
+            return cls._direct_closing_response(latest_user_text, history)
+
         # Keep normal dialogue generation model-driven. This hook is only kept
-        # for future non-generative emergency responses, not for language choice.
+        # for narrow high-confidence responses, not broad language choice.
         return ""
+
+    @classmethod
+    def finalize_response(cls, prompt_or_text: str, response_text: str) -> str:
+        """Light cleanup after model generation without replacing model behavior."""
+        response = cls._strip_special_tokens(response_text)
+        history = cls.extract_prompt_history(prompt_or_text)
+        latest_user_text = cls.extract_latest_user_text(prompt_or_text)
+        mode = cls.classify_user_intent(latest_user_text, history)
+
+        if mode == "translation":
+            target = cls._infer_explicit_translation_target(history, latest_user_text)
+            response = cls._strip_translation_preface(response, target)
+            response = cls._trim_unwanted_followup(response)
+            return response.strip()
+
+        if mode == "correction":
+            return response.strip()
+
+        if cls._is_explanation_like_request_v2(latest_user_text):
+            response = cls._trim_unwanted_followup(response)
+        return response.strip()
 
     @classmethod
     def response_needs_retry(cls, prompt_or_text: str, response_text: str) -> bool:
@@ -441,50 +767,40 @@ class DialoguePolicy:
         if mode == "translation":
             if cls._looks_like_translation_command_echo(response):
                 return True
-            translation_target = cls._infer_translation_target(history, latest_user_text)
+            translation_target = cls._infer_explicit_translation_target(history, latest_user_text)
             if translation_target and cls._translation_has_wrong_target_language(translation_target, response):
                 return True
-            # Translation is a meta request. Once it passes translation checks,
-            # do not apply role-play language rules that may reject Chinese output.
+            if cls._has_unwanted_followup(response):
+                return True
             return False
 
         if mode == "closing":
-            if cls._extract_questions(response):
+            if cls._has_question_mark(response) or cls._extract_questions(response):
                 return True
-            if cls._is_bad_generic_assistant(response):
+            if cls._matches_any(response, cls.CLOSING_CONTINUATION_PATTERNS):
                 return True
             return False
 
-        if state.has_roleplay and cls._is_bad_generic_assistant(response):
-            return True
-        if (
-            mode in {"roleplay", "mixed_practice", "general_tutor"}
-            and state.last_assistant_text
-            and not cls._is_repeat_request(latest_user_text)
-            and cls._repeats_recent_statement(response, [state.last_assistant_text])
+        if state.last_assistant_text and not cls._is_repeat_request(latest_user_text) and cls._repeats_recent_statement(
+            response,
+            [state.last_assistant_text],
         ):
+            return True
+        if state.recent_ai_questions and cls._repeats_recent_question(response, state.recent_ai_questions):
+            return True
+        if cls._misreads_short_answer_as_explanation(latest_user_text, response, state):
+            return True
+        if cls._looks_like_context_break(latest_user_text, response, state):
+            return True
+        if cls._is_explanation_like_request_v2(latest_user_text) and cls._has_unwanted_followup(response):
             return True
         if mode == "correction" and not cls._looks_like_relaxed_correction_response(
             response,
-            state.last_user_english or cls._extract_target_from_prompt(prompt_or_text),
+            state.last_user_english,
         ):
             return True
-        if mode == "language_switch":
-            if cls._is_language_switch_to_chinese(latest_user_text) and not cls._contains_chinese(response):
-                return True
-            if cls._is_language_switch_to_english(latest_user_text) and cls._mostly_chinese(response):
-                return True
         if not state.repeat_user_answer and cls._starts_with_user_echo(response):
             return True
-        if state.teacher_should_ask and cls._asks_user_to_drive(response):
-            return True
-        if cls._repeats_recent_question(response, state.recent_ai_questions):
-            return True
-        if mode == "roleplay" and (state.practice_language == "English" or state.has_roleplay):
-            if cls._is_chinese_meta_turn(latest_user_text):
-                return False
-            if cls._mostly_chinese(response):
-                return True
         return False
 
     @classmethod
@@ -493,6 +809,28 @@ class DialoguePolicy:
         latest_user_text = cls.extract_latest_user_text(prompt_or_text)
         mode = cls.classify_user_intent(latest_user_text, history)
         state = cls.extract_state(history, latest_user_text)
+
+        if mode == "translation":
+            target = cls._infer_explicit_translation_target(history, latest_user_text)
+            if target:
+                clean_target = cls._strip_special_tokens(target)
+                return f"我找到要翻译的内容了，但这次模型没有稳定生成译文：{clean_target}"
+            return "请把你想翻译的句子单独发给我。"
+
+        if mode == "correction":
+            target = cls._strip_special_tokens(state.last_user_english)
+            if target:
+                return f"More natural: {target}"
+            return "Please send the sentence you want me to correct."
+
+        if mode == "closing":
+            if re.search(r"[\u4e00-\u9fff]", latest_user_text or ""):
+                return "\u597d\u7684\uff0c\u4eca\u5929\u5148\u5230\u8fd9\u91cc\u3002"
+            return "Got it. We can stop here for now."
+
+        if state.last_assistant_text and not cls._is_repeat_request(latest_user_text):
+            return "Let me answer that more directly."
+        return "Tell me what you'd like to practice next."
 
         if mode == "translation":
             target = cls._infer_translation_target(history, latest_user_text)
@@ -544,6 +882,65 @@ class DialoguePolicy:
         history = DialoguePolicy.extract_prompt_history(prompt)
         latest_user_text = DialoguePolicy.extract_latest_user_text(prompt)
         mode = DialoguePolicy.classify_user_intent(latest_user_text, history)
+
+        if mode == "closing":
+            instruction = (
+                "The previous draft was rejected because the user is closing or completing the current task. "
+                "Reply with one short natural closing sentence. "
+                "Match the user's language when it is obvious. "
+                "Do not ask any question. Do not start a new scenario. Do not invite a new topic. "
+                "Do not suggest continuing, moving on, trying another sentence, or practicing something else. "
+                "Use plain text only and output only the final assistant reply."
+            )
+            return f"{prompt}\n<|im_start|>system\n{instruction}<|im_end|>\n<|im_start|>assistant\n"
+
+        if mode == "translation":
+            target = DialoguePolicy._infer_explicit_translation_target(history, latest_user_text)
+            instruction = (
+                "The previous draft mishandled a translation or meaning request. "
+                "Translate the referenced target only, not the user's command. "
+                "If the target is English, answer in natural Chinese. "
+                "If the target is Chinese, answer in natural English. "
+                "Do not add a follow-up question, teaching prompt, or role-play continuation. "
+                f"Referenced target: {target or '(infer from recent assistant text)'} "
+                "Use plain text only and output only the final assistant reply."
+            )
+            return f"{prompt}\n<|im_start|>system\n{instruction}<|im_end|>\n<|im_start|>assistant\n"
+
+        if mode == "correction":
+            state = DialoguePolicy.extract_state(history, latest_user_text)
+            instruction = (
+                "The previous draft mishandled a correction request. "
+                "Give a natural corrected English version for the target sentence, with at most one brief reason if useful. "
+                "Do not ask the user to resend the sentence and do not continue role-play. "
+                f"Target sentence: {state.last_user_english or latest_user_text} "
+                "Use plain text only and output only the final assistant reply."
+            )
+            return f"{prompt}\n<|im_start|>system\n{instruction}<|im_end|>\n<|im_start|>assistant\n"
+
+        if DialoguePolicy._is_explanation_like_request_v2(latest_user_text):
+            instruction = (
+                "The previous draft mishandled an explanation request. "
+                "Explain the word, phrase, or usage directly and briefly. "
+                "Prefer Chinese if the user asked in Chinese or mixed Chinese. "
+                "Include one short example when useful. "
+                "Do not add a new practice question. "
+                "Use plain text only and output only the final assistant reply."
+            )
+            return f"{prompt}\n<|im_start|>system\n{instruction}<|im_end|>\n<|im_start|>assistant\n"
+
+        generic_instruction = (
+            "The previous draft was rejected because it was empty, repeated the previous assistant reply, "
+            "echoed a translation command, or otherwise failed to respond directly. "
+            "Now answer the latest user message naturally using the recent context. "
+            "Do not repeat your previous assistant reply unless the user explicitly asked you to repeat it. "
+            "If the latest user message is a short answer, infer it from the previous assistant question and continue the same scene. "
+            "If the user asks to translate a referenced sentence, translate the referenced recent text instead of the command itself. "
+            "If the user asks for correction, provide a natural correction without using a rigid template. "
+            "Use plain text only and output only the final assistant reply."
+        )
+        return f"{prompt}\n<|im_start|>system\n{generic_instruction}<|im_end|>\n<|im_start|>assistant\n"
+
         if mode == "translation":
             instruction = (
                 "The previous draft handled a translation request incorrectly. "
@@ -910,6 +1307,8 @@ class DialoguePolicy:
         normalized: List[dict] = []
         for message in history:
             role = str(message.get("role", "user")).strip().lower()
+            if role == "system":
+                continue
             if role not in {"user", "assistant"}:
                 role = "assistant" if role in {"ai", "bot"} else "user"
             content = str(message.get("content", "")).strip()
@@ -1003,6 +1402,9 @@ class DialoguePolicy:
         quoted = re.findall(r'["“‘](.+?)["”’]', raw)
         if quoted:
             return quoted[-1].strip()
+        single_quoted = re.findall(r"'([^']{1,120})'", raw)
+        if single_quoted:
+            return single_quoted[-1].strip()
 
         match = re.search(
             "(?:\u7ffb\u8bd1|\\btranslate\\b)(?:\u4e00\u4e0b|\u6210\u4e2d\u6587|\u6210\u82f1\u6587| into chinese| into english)?\\s*[:：]\\s*(.+)$",
@@ -1011,8 +1413,22 @@ class DialoguePolicy:
         )
         if match:
             return match.group(1).strip()
+        suffix_patterns = (
+            r"(.+?)\s*(?:\u7528\u4e2d\u6587\u7ffb\u8bd1\u8fd9\u53e5\u8bdd|\u7528\u4e2d\u6587\u7ffb\u8bd1\u8fd9\u53e5|\u7ffb\u8bd1\u8fd9\u53e5\u8bdd|\u7ffb\u8bd1\u8fd9\u53e5|\u8bd1\u4e00\u4e0b\u8fd9\u53e5\u8bdd)$",
+            r"(.+?)\s*(?:translate this sentence|translate this|translate it into chinese|translate it into english)$",
+        )
+        for pattern in suffix_patterns:
+            match = re.search(pattern, raw, flags=re.IGNORECASE)
+            if match:
+                candidate = match.group(1).strip(" ：:，,。.\"'")
+                if candidate:
+                    return candidate
         if re.search(r"(\u8fd9\u53e5\u8bdd|\u8fd9\u53e5|\u8fd9\u4e2a\u53e5\u5b50)", raw) and re.search(r"[A-Za-z]{2,}", raw):
-            cleaned = re.sub(r"(\u8fd9\u53e5\u8bdd|\u8fd9\u53e5|\u8fd9\u4e2a\u53e5\u5b50)", "", raw).strip()
+            cleaned = re.sub(
+                r"(\u7528\u4e2d\u6587\u7ffb\u8bd1|\u7528\u82f1\u6587\u7ffb\u8bd1|\u7ffb\u8bd1|\u8bd1\u4e00\u4e0b|\u8fd9\u53e5\u8bdd|\u8fd9\u53e5|\u8fd9\u4e2a\u53e5\u5b50)",
+                "",
+                raw,
+            ).strip(" ：:，,。.")
             if re.search(r"[A-Za-z]{2,}", cleaned):
                 return cleaned
         return ""
@@ -1099,6 +1515,7 @@ class DialoguePolicy:
             or cls._matches_any(stripped, cls.STOP_CORRECTION_PATTERNS)
             or cls._is_closing_request(stripped)
             or cls._is_correction_setup_request(stripped)
+            or cls._is_explicit_translation_request_v2(stripped)
             or cls._matches_any(stripped, cls.TRANSLATION_REQUEST_PATTERNS)
             or lowered in {"in english", "speak english", "in chinese", "speak chinese"}
         )
@@ -1137,6 +1554,233 @@ class DialoguePolicy:
         if not stripped:
             return False
         return cls._matches_any(stripped, cls.CLOSING_PATTERNS)
+
+    @classmethod
+    def _is_short_contextual_user_turn(
+        cls,
+        text: str,
+        history: Iterable[Mapping[str, str]] | None = None,
+    ) -> bool:
+        stripped = (text or "").strip()
+        if not stripped or cls._has_question_mark(stripped):
+            return False
+        if (
+            cls._is_closing_request(stripped)
+            or cls._is_explicit_translation_request_v2(stripped)
+            or cls._is_explicit_correction_request_v2(stripped)
+            or cls._is_explanation_like_request_v2(stripped)
+            or cls._is_meta_instruction(stripped)
+        ):
+            return False
+        normalized_history = cls._normalized_history(history or [])
+        has_recent_assistant = any(message.get("role") == "assistant" for message in normalized_history[-4:])
+        if not has_recent_assistant:
+            return False
+        words = re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]{1,4}", stripped)
+        return len(words) <= 7 or len(stripped) <= 36
+
+    @classmethod
+    def _is_explanation_like_request_v2(cls, text: str) -> bool:
+        stripped = (text or "").strip()
+        if not stripped:
+            return False
+        lowered = stripped.lower()
+        if cls._is_explicit_translation_request_v2(stripped) or cls._is_explicit_correction_request_v2(stripped):
+            return False
+        if cls._matches_any(stripped, cls.EXPLANATION_PATTERNS):
+            return True
+        if re.search(r"\bwhat (does|do|is|are) .{1,80}\b(mean|means)\b", lowered):
+            return True
+        if re.search(r"\bhow to use\b", lowered):
+            return True
+        if re.search(r"\b(is|are) .{1,60}\b(same|different)\b", lowered):
+            return True
+        if re.search(r"\b(what about|and|not)\s+['\"“‘][^'\"”’]{1,60}['\"”’]\??$", stripped, flags=re.IGNORECASE):
+            return True
+        if re.search(r"^[A-Za-z][A-Za-z '\-]{1,35}\?$", stripped):
+            return True
+        return False
+
+    @staticmethod
+    def _strip_special_tokens(text: str) -> str:
+        cleaned = re.sub(r"<\|[^>]+?\|>", "", text or "")
+        cleaned = cleaned.replace("**", "")
+        return re.sub(r"\s+", " ", cleaned).strip()
+
+    @classmethod
+    def _strip_translation_preface(cls, response: str, target: str = "") -> str:
+        raw = (response or "").strip()
+        if not raw:
+            return ""
+
+        target_has_cjk = bool(re.search(r"[\u4e00-\u9fff]", target or ""))
+        quoted = re.findall(r'["“](.+?)["”]', raw)
+        if target_has_cjk and quoted:
+            english_quotes = [item.strip() for item in quoted if re.search(r"[A-Za-z]{2,}", item)]
+            if english_quotes:
+                return english_quotes[0]
+
+        raw = re.sub(r"^(sure|of course|okay|ok)[,，!！\s\-—:：]+", "", raw, flags=re.IGNORECASE).strip()
+        raw = re.sub(r"^(you can say|i can say|say)\s*[:：\-—]?\s*", "", raw, flags=re.IGNORECASE).strip()
+
+        if target_has_cjk:
+            match = re.match(r"^(it'?s|it is)\s+called\s+(?:a|an|the)?\s*([^。.!?？]+)[。.!?？]?$", raw, flags=re.IGNORECASE)
+            if match:
+                return match.group(2).strip(" \"'“”")
+        return raw
+
+    @classmethod
+    def _trim_unwanted_followup(cls, response: str) -> str:
+        raw = (response or "").strip()
+        if not raw:
+            return ""
+        followup_start = (
+            r"would you like",
+            r"do you want",
+            r"can you tell me",
+            r"try saying",
+            r"let'?s try",
+            r"now try",
+            r"repeat after me",
+            r"say it",
+        )
+        english_pattern = r"([。.!?？][\"”']?\s+)(?:" + "|".join(followup_start) + r")\b.*$"
+        raw = re.sub(english_pattern, r"\1", raw, flags=re.IGNORECASE).strip()
+        chinese_pattern = r"([。.!?？]\s*)(需要我|要不要|你要不要|你想不想|请你试着|跟我说).*$"
+        raw = re.sub(chinese_pattern, r"\1", raw).strip()
+        return raw
+
+    @classmethod
+    def _has_unwanted_followup(cls, response: str) -> bool:
+        return cls._trim_unwanted_followup(response or "") != (response or "").strip()
+
+    @classmethod
+    def _misreads_short_answer_as_explanation(
+        cls,
+        latest_user_text: str,
+        response: str,
+        state: TeachingSessionState,
+    ) -> bool:
+        if not state.last_assistant_text:
+            return False
+        if not cls._is_short_contextual_user_turn(latest_user_text, [{"role": "assistant", "content": state.last_assistant_text}]):
+            return False
+        normalized = re.sub(r"\s+", " ", response or "").strip().lower()
+        bad_patterns = (
+            r"\bwant me to explain\b",
+            r"\bwould you like me to explain\b",
+            r"\bwhat does .{1,50} mean\b",
+            r"\bwhat does that word mean\b",
+            r"\bin your own words\b",
+        )
+        return any(re.search(pattern, normalized) for pattern in bad_patterns)
+
+    @classmethod
+    def _looks_like_context_break(
+        cls,
+        latest_user_text: str,
+        response: str,
+        state: TeachingSessionState,
+    ) -> bool:
+        if not state.last_assistant_text and not state.has_roleplay:
+            return False
+        if not cls._is_short_contextual_user_turn(latest_user_text, [{"role": "assistant", "content": state.last_assistant_text}]):
+            return False
+        normalized = re.sub(r"\s+", " ", response or "").strip().lower()
+        context_break_patterns = (
+            r"\bwhat would you like to do next\b",
+            r"\bwhat else would you like help with\b",
+            r"\bwhat would you like to talk about\b",
+            r"\btalk about something else\b",
+            r"\bwould you like help with something else\b",
+            r"\bwhat'?s next after that\b",
+        )
+        return any(re.search(pattern, normalized) for pattern in context_break_patterns)
+
+    @staticmethod
+    def _has_question_mark(text: str) -> bool:
+        return bool(re.search(r"[?\uff1f]", text or ""))
+
+    @classmethod
+    def _direct_closing_response(cls, user_text: str, history: Iterable[Mapping[str, str]] | None = None) -> str:
+        """Return a concise, natural closing without asking the model to improvise."""
+        text = (user_text or "").strip()
+        lowered = text.lower()
+        has_chinese = bool(re.search(r"[\u4e00-\u9fff]", text))
+
+        if has_chinese:
+            if "\u660e\u5929" in text:
+                return "\u597d\u7684\uff0c\u660e\u5929\u6211\u4eec\u518d\u7ee7\u7eed\u3002"
+            if "\u62dc\u62dc" in text or "\u518d\u89c1" in text:
+                return "\u597d\u7684\uff0c\u62dc\u62dc\uff0c\u4e0b\u6b21\u89c1\u3002"
+            if "\u8c22\u8c22" in text:
+                if "\u4e0d\u7528\u7ee7\u7eed\u95ee" in text or "\u4e0d\u7528\u518d\u95ee" in text:
+                    return "\u4e0d\u5ba2\u6c14\uff0c\u4e0d\u7ee7\u7eed\u95ee\u4e86\u3002"
+                return "\u4e0d\u5ba2\u6c14\uff0c\u4eca\u5929\u5148\u5230\u8fd9\u91cc\u3002"
+            if "\u5fd9" in text:
+                return "\u597d\u7684\uff0c\u5148\u53bb\u5fd9\u5427\u3002"
+            if "\u7d2f" in text:
+                return "\u597d\u7684\uff0c\u5148\u4f11\u606f\u4e00\u4e0b\u3002"
+            if "\u4e0d\u804a" in text:
+                return "\u597d\u7684\uff0c\u4eca\u5929\u5148\u4e0d\u804a\u4e86\u3002"
+            if "\u4e0d\u7ec3" in text:
+                return "\u597d\u7684\uff0c\u6211\u4eec\u5148\u505c\u5728\u8fd9\u91cc\u3002"
+            if "\u7ec3\u5f97" in text and "\u5dee\u4e0d\u591a" in text:
+                return "\u597d\u7684\uff0c\u4eca\u5929\u7ec3\u5f97\u5dee\u4e0d\u591a\u4e86\u3002"
+            if "\u8fd9\u6bb5\u5bf9\u8bdd" in text:
+                return "\u597d\u7684\uff0c\u8fd9\u6bb5\u5bf9\u8bdd\u7ed3\u675f\u3002"
+            if "\u8fd9\u4e2a\u7ec3\u4e60" in text:
+                return "\u597d\u7684\uff0c\u8fd9\u4e2a\u7ec3\u4e60\u5148\u7ed3\u675f\u3002"
+            if "\u8fd9\u8f6e" in text:
+                return "\u597d\u7684\uff0c\u8fd9\u8f6e\u7ec3\u4e60\u7ed3\u675f\u3002"
+            if "\u4eca\u5929\u7684\u7ec3\u4e60" in text:
+                return "\u597d\u7684\uff0c\u4eca\u5929\u7684\u7ec3\u4e60\u7ed3\u675f\u3002"
+            if "\u8fd9\u6b21\u7ec3\u4e60" in text:
+                return "\u6ca1\u95ee\u9898\uff0c\u8fd9\u6b21\u7ec3\u4e60\u5230\u8fd9\u91cc\u7ed3\u675f\u3002"
+            if "\u53ef\u4ee5\u7ed3\u675f" in text:
+                return "\u53ef\u4ee5\uff0c\u4eca\u5929\u7684\u7ec3\u4e60\u5230\u8fd9\u91cc\u7ed3\u675f\u3002"
+            return "\u597d\u7684\uff0c\u4eca\u5929\u5148\u5230\u8fd9\u91cc\u3002"
+
+        if "thank you, bye" in lowered or lowered.strip() in {"bye", "goodbye"}:
+            return "You're welcome. Bye."
+        if "see you next time" in lowered:
+            return "You're welcome. See you next time."
+        if "no more questions" in lowered:
+            return "Of course. No more questions."
+        if "i need to go" in lowered:
+            return "Okay. See you later."
+        if "tired" in lowered:
+            return "Sure. Rest a bit."
+        if "can we finish here" in lowered:
+            return "Yes. We can finish here."
+        if "end the role-play" in lowered:
+            return "Sure. The role-play is finished."
+        if "end this practice" in lowered:
+            return "Okay. We can end this practice."
+        if "stop here" in lowered or "let's stop here" in lowered:
+            return "Sure. We'll stop here."
+        if "that's all for today" in lowered:
+            return "Okay. That's all for today."
+        if "that's enough" in lowered:
+            return "Okay. That's enough for now."
+        if "i'm finished" in lowered:
+            return "Sure. We are finished for today."
+        if "i'm done" in lowered:
+            return "No problem. We can stop here."
+        return cls._scene_aware_english_closing(history or [])
+
+    @classmethod
+    def _scene_aware_english_closing(cls, history: Iterable[Mapping[str, str]]) -> str:
+        text = " ".join((message.get("content", "") or "") for message in cls._normalized_history(history)).lower()
+        if re.search(r"\b(airport|check[- ]?in|passport|flight|boarding)\b", text):
+            return "Thank you. Have a safe trip!"
+        if re.search(r"\b(restaurant|order|ordering|waiter|food|meal|beef noodles|cola)\b", text):
+            return "Thank you. Have a great day!"
+        if re.search(r"\b(interview|job|excel)\b", text):
+            return "Thank you for practicing. Have a great day!"
+        if re.search(r"\b(campus|library|class)\b", text):
+            return "Okay, see you later!"
+        return "Thanks for the conversation. Have a great day!"
 
     @classmethod
     def _is_greeting(cls, text: str) -> bool:
